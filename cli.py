@@ -13,9 +13,6 @@ Usage examples:
     # Run with JUnit output (for CI/CD)
     etl-validate run tests/suite.yaml --output junit --output-path results.xml
 
-    # Profile a table and auto-generate a test suite
-    etl-validate profile --table DB.SCHEMA.TABLE --dsn "$SNC_DSN" --output suite.yaml
-
     # Show historical results and trends
     etl-validate history --suite order_migration --days 7
 
@@ -182,60 +179,6 @@ def history(suite, days):
         return
 
     click.echo(df.to_string(index=False))
-
-
-@cli.command()
-@click.option("--table", "-t", required=True, help="Fully-qualified table name to profile")
-@click.option("--dsn", required=True, help="DSN for the connection")
-@click.option("--user", "-u", default="", help="Database user")
-@click.option("--password", "-P", default="", help="Database password")
-@click.option("--platform", default="teradata", help="Database platform (teradata or csv)")
-@click.option("--target-table", default=None, help="Target table (defaults to same as source)")
-@click.option("--output", "-o", type=click.Path(), default=None,
-              help="Output YAML file path")
-@click.option("--sample-pct", default=100.0, help="Sampling percentage for profiling")
-def profile(table, dsn, user, password, platform, target_table, output, sample_pct):
-    """Profile a table and auto-generate a YAML test suite."""
-    from .connectors.base import ConnectionConfig
-    from .connectors.registry import get_connector
-    from .engine.profiler import profile_table, generate_suite_yaml
-
-    config = ConnectionConfig(
-        platform=platform, dsn=dsn, user=user, password=password,
-    )
-    conn = get_connector(platform, config)
-    conn.connect()
-
-    try:
-        tp = profile_table(conn, table, sample_pct=sample_pct)
-    finally:
-        conn.close()
-
-    click.echo(f"\nTable: {tp.table}")
-    click.echo(f"Rows:  {tp.row_count:,}")
-    click.echo(f"Cols:  {tp.column_count}")
-    if tp.duplicate_key_candidates:
-        click.echo(f"Key candidates: {', '.join(tp.duplicate_key_candidates)}")
-
-    click.echo("\nColumn Profiles:")
-    for cp in tp.columns:
-        line = f"  {cp.name:<30} {cp.data_type:<25} null={cp.null_pct:.1f}%"
-        if cp.min_val is not None:
-            line += f"  range=[{cp.min_val}, {cp.max_val}]"
-        if cp.distinct_count >= 0:
-            line += f"  distinct={cp.distinct_count}"
-        click.echo(line)
-
-    tgt = target_table or table
-    yaml_str = generate_suite_yaml(table, tgt, tp, output_path=output)
-
-    if not output:
-        click.echo(f"\n{'='*50}")
-        click.echo("Generated Test Suite (YAML):")
-        click.echo(f"{'='*50}")
-        click.echo(yaml_str)
-    else:
-        click.echo(f"\nSuite written to: {output}")
 
 
 @cli.command()

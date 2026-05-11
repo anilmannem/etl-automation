@@ -17,7 +17,6 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from etl_validator.checks.base import CheckConfig, Status
 from etl_validator.connectors.base import ConnectionConfig
 from etl_validator.connectors.registry import get_connector
 from etl_validator.engine.executor import SuiteResult, execute_suite
