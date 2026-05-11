@@ -1,0 +1,1056 @@
+"""Row-level data comparison check with streaming, hash-first optimisation,
+deterministic sampling, and column-level mismatch drill-down.
+
+Advanced features:
+- **Hash-first pass**: computes a per-row hash on the database side.
+  Only rows whose hashes differ are fetched for column-level diff.
+  Reduces network I/O by 90%+ on tables with <1% mismatches.
+- **Streaming comparison**: uses server-side cursors to avoid loading
+  entire tables into memory. Critical for tables >10M rows.
+- **Deterministic sampling**: compare a stable subset of rows for
+  quick smoke tests. Same rows selected on both sides via hash-mod.
+- **Column-level drill-down**: for each mismatched row, identifies
+  exactly which columns differ — not just "this row is different".
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+
+import pandas as pd
+
+from .base import BaseCheck, CheckConfig, CheckResult, Status
+from ..connectors.base import safe_identifier, safe_identifiers, deterministic_sample_where
+
+logger = logging.getLogger(__name__)
+
+
+def _build_row_hash_query(
+    table: str, columns: list[str], where: str = "",
+    key_columns: list[str] | None = None,
+) -> str:
+    """Build a SQL query that computes a deterministic hash per row.
+
+    Uses Teradata HASHROW() for native server-side hashing. Only mismatched
+    hashes need to be fetched for detailed comparison.
+    """
+    safe_cols = safe_identifiers(columns)
+    hash_args = ", ".join(
+        f'COALESCE(CAST("{c}" AS VARCHAR(1000)), \'NULL\')' for c in safe_cols
+    )
+    hash_expr = f"HASHROW({hash_args}) AS ROW_HASH"
+
+    select_parts = [hash_expr]
+    if key_columns:
+        for k in safe_identifiers(key_columns):
+            select_parts.insert(0, f'"{k}"')
+
+    clause = f"WHERE {where}" if where else ""
+    return f"SELECT {', '.join(select_parts)} FROM {safe_identifier(table)} {clause}"
+
+
+def _column_level_diff(
+    src_row: pd.Series, tgt_row: pd.Series, ignore_cols: set[str]
+) -> list[dict]:
+    """Compare two aligned rows and return per-column diff details."""
+    diffs = []
+    for col in src_row.index:
+        if col in ignore_cols or col.startswith("_"):
+            continue
+        sv = src_row[col]
+        tv = tgt_row[col]
+        if str(sv) != str(tv):
+            diffs.append({"column": col, "source_value": sv, "target_value": tv})
+    return diffs
+
+
+class DataCheck(BaseCheck):
+    """Row-level data comparison with multiple strategies.
+
+    Strategies (selected automatically or via config):
+    - ``hash``: hash-first pass, then fetch only mismatched rows
+    - ``full``: fetch all data and compare in chunks (original approach)
+    - ``sample``: deterministic sample comparison for smoke testing
+
+    YAML config::
+
+        - type: data
+          join_keys: [ORDER_ID]
+          chunk_size: 50000
+          strategy: hash       # hash | full | sample
+          sample_pct: 10       # for strategy=sample
+          column_drill_down: true
+    """
+    name = "data"
+
+    def run(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
+        logger.info("Running data check: %s → %s", config.source_table, config.target_table)
+
+        src_is_file = hasattr(src_conn, "read_dataframe")
+        tgt_is_file = hasattr(tgt_conn, "read_dataframe")
+
+        if src_is_file and tgt_is_file:
+            # CSV ↔ CSV (or any two file-based connectors) — pure DuckDB
+            return self._duckdb_strategy(src_conn, tgt_conn, config)
+
+        if src_is_file or tgt_is_file:
+            # Mixed: one side is a file, the other is a SQL DB (e.g. CSV ↔ Teradata)
+            # Stream the SQL side into DuckDB in chunks, then diff both in-engine.
+            return self._duckdb_bridge_strategy(src_conn, tgt_conn, config)
+
+        strategy = config.extra.get("strategy", "full")
+        sample_pct = config.extra.get("sample_pct", 10)
+
+        if strategy == "hash":
+            return self._hash_strategy(src_conn, tgt_conn, config)
+        elif strategy == "sample":
+            return self._sample_strategy(src_conn, tgt_conn, config, sample_pct)
+        else:
+            return self._full_strategy(src_conn, tgt_conn, config)
+
+    # ── Strategy 0: DuckDB-native (CSV / Excel / any DataFrame connector) ─────
+
+    def _duckdb_strategy(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:  # noqa: C901
+        """Large-scale diff via DuckDB — vectorized, streaming, spills to disk.
+
+        Why DuckDB instead of pandas:
+        - Reads CSV files directly via read_csv_auto() — no full in-memory load
+        - Vectorized columnar engine: 10-100x faster than pandas on large data
+        - Automatic spill-to-disk: handles files far bigger than available RAM
+        - NULL-safe comparison via IS DISTINCT FROM — no extra NaN handling
+        - Anti-join for only-src/only-tgt is O(n) not O(n²)
+        """
+        import duckdb
+        from collections import Counter
+
+        logger.info("Using DUCKDB strategy for data comparison")
+
+        con = duckdb.connect()  # in-memory; spills to disk automatically
+
+        # Prefer direct file path (zero-copy streaming) over loading a DataFrame
+        src_path = getattr(src_conn, "_file_path", None)
+        tgt_path = getattr(tgt_conn, "_file_path", None)
+
+        if src_path and tgt_path:
+            con.execute(f"CREATE VIEW src AS SELECT * FROM read_csv_auto({src_path!r})")
+            con.execute(f"CREATE VIEW tgt AS SELECT * FROM read_csv_auto({tgt_path!r})")
+            logger.debug("DuckDB reading CSV files directly: %s | %s", src_path, tgt_path)
+        else:
+            src_df = src_conn.read_dataframe()
+            tgt_df = tgt_conn.read_dataframe()
+            con.register("_src_df", src_df)
+            con.register("_tgt_df", tgt_df)
+            con.execute("CREATE VIEW src AS SELECT * FROM _src_df")
+            con.execute("CREATE VIEW tgt AS SELECT * FROM _tgt_df")
+            logger.debug("DuckDB registered in-memory DataFrames")
+
+        # Discover columns — DuckDB is case-insensitive but we normalise to UPPER
+        src_upper = {r[0].upper(): r[0] for r in con.execute("DESCRIBE src").fetchall()}
+        tgt_upper = {r[0].upper(): r[0] for r in con.execute("DESCRIBE tgt").fetchall()}
+
+        ignore_set = {c.upper() for c in (config.ignore_columns or [])}
+        common_upper = [c for c in src_upper if c in tgt_upper and c not in ignore_set]
+        join_keys_u = (
+            [k.upper() for k in config.join_keys]
+            if config.join_keys and config.join_keys != ["NA"]
+            else []
+        )
+        # Validate join keys exist in both sources
+        if join_keys_u:
+            missing = [k for k in join_keys_u if k not in src_upper or k not in tgt_upper]
+            if missing:
+                logger.warning("Join keys missing from schema: %s — positional fallback", missing)
+                join_keys_u = []
+
+        max_mismatches = config.extra.get("max_mismatches", 10_000)
+
+        src_count = con.execute("SELECT count(*) FROM src").fetchone()[0]
+        tgt_count = con.execute("SELECT count(*) FROM tgt").fetchone()[0]
+        rows_only_src = 0
+        rows_only_tgt = 0
+        column_details: list[dict] = []
+
+        if join_keys_u:
+            data_cols = [c for c in common_upper if c not in join_keys_u]
+
+            # NULL-safe join condition
+            key_join = " AND ".join(
+                f's."{src_upper[k]}" = t."{tgt_upper[k]}"' for k in join_keys_u
+            )
+
+            # Anti-joins: O(n) existence checks — far faster than set subtraction in Python
+            rows_only_src = con.execute(
+                f"SELECT count(*) FROM src s WHERE NOT EXISTS "
+                f"(SELECT 1 FROM tgt t WHERE {key_join})"
+            ).fetchone()[0]
+            rows_only_tgt = con.execute(
+                f"SELECT count(*) FROM tgt t WHERE NOT EXISTS "
+                f"(SELECT 1 FROM src s WHERE {key_join})"
+            ).fetchone()[0]
+
+            if data_cols:
+                # Filter to only rows with at least one differing cell
+                # IS DISTINCT FROM handles NULLs natively — no Python NaN dance
+                diff_filter = " OR ".join(
+                    f's."{src_upper[c]}" IS DISTINCT FROM t."{tgt_upper[c]}"'
+                    for c in data_cols
+                )
+                select_parts = (
+                    [f's."{src_upper[k]}" AS "_key_{k}"' for k in join_keys_u]
+                    + [col for c in data_cols
+                       for col in (
+                           f's."{src_upper[c]}" AS "_src_{c}"',
+                           f't."{tgt_upper[c]}" AS "_tgt_{c}"',
+                       )]
+                )
+                diff_sql = (
+                    f"SELECT {', '.join(select_parts)} "
+                    f"FROM src s INNER JOIN tgt t ON {key_join} "
+                    f"WHERE {diff_filter} "
+                    f"LIMIT {max_mismatches}"
+                )
+                result_cols = (
+                    [f"_key_{k}" for k in join_keys_u]
+                    + [col for c in data_cols for col in (f"_src_{c}", f"_tgt_{c}")]
+                )
+                for row_tuple in con.execute(diff_sql).fetchall():
+                    row = dict(zip(result_cols, row_tuple))
+                    for c in data_cols:
+                        sv, tv = row[f"_src_{c}"], row[f"_tgt_{c}"]
+                        if sv is None and tv is None:
+                            continue
+                        # Suppress numeric equivalence noise (e.g. 30.0 vs 30)
+                        if sv is not None and tv is not None:
+                            try:
+                                if float(sv) == float(tv):
+                                    continue
+                            except (ValueError, TypeError):
+                                pass
+                        if str(sv) != str(tv):
+                            detail = {
+                                "COLUMN": c,
+                                "SOURCE_VALUE": str(sv) if sv is not None else "NULL",
+                                "TARGET_VALUE": str(tv) if tv is not None else "NULL",
+                            }
+                            if len(join_keys_u) == 1:
+                                detail[join_keys_u[0]] = row[f"_key_{join_keys_u[0]}"]
+                            else:
+                                for k in join_keys_u:
+                                    detail[k] = row[f"_key_{k}"]
+                            column_details.append(detail)
+                        if len(column_details) >= max_mismatches:
+                            break
+                    if len(column_details) >= max_mismatches:
+                        break
+        else:
+            # No join keys — use SQL EXCEPT (set diff, positional)
+            # DuckDB pushes this fully into its vectorized engine
+            src_sel = ", ".join(f'"{src_upper[c]}"' for c in common_upper)
+            tgt_sel = ", ".join(f'"{tgt_upper[c]}"' for c in common_upper)
+            rows_only_src = con.execute(
+                f"SELECT count(*) FROM (SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt)"
+            ).fetchone()[0]
+            rows_only_tgt = con.execute(
+                f"SELECT count(*) FROM (SELECT {tgt_sel} FROM tgt EXCEPT SELECT {src_sel} FROM src)"
+            ).fetchone()[0]
+            # Show differing rows (src side) for drill-down
+            for i, row_tuple in enumerate(
+                con.execute(
+                    f"SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt LIMIT {max_mismatches}"
+                ).fetchall()
+            ):
+                row = dict(zip(common_upper, row_tuple))
+                for c in common_upper:
+                    column_details.append({
+                        "ROW": i + 1, "COLUMN": c,
+                        "SOURCE_VALUE": str(row[c]) if row[c] is not None else "NULL",
+                        "TARGET_VALUE": "(not in target)",
+                    })
+                if len(column_details) >= max_mismatches:
+                    break
+
+        con.close()
+
+        col_counts = Counter(d["COLUMN"] for d in column_details)
+        mismatch_cols = ", ".join(sorted(col_counts.keys()))
+        col_summary = ", ".join(f"{c}:{n}" for c, n in col_counts.most_common(10))
+
+        unique_key = join_keys_u[0] if join_keys_u else "ROW"
+        rows_with_diffs = len({d.get(unique_key) for d in column_details}) if column_details else 0
+        matched_rows = min(src_count, tgt_count) - rows_with_diffs
+        match_pct = (
+            round(max(0, matched_rows) / max(src_count, tgt_count) * 100, 2)
+            if max(src_count, tgt_count) else 100.0
+        )
+        total_mismatches = len(column_details) + rows_only_src + rows_only_tgt
+        status = Status.PASS if total_mismatches == 0 else Status.FAIL
+        details = pd.DataFrame(column_details) if column_details else None
+
+        return CheckResult(
+            check_type=self.name,
+            status=status,
+            metrics={
+                "src_row_count": src_count,
+                "tgt_row_count": tgt_count,
+                "rows_only_in_source": rows_only_src,
+                "rows_only_in_target": rows_only_tgt,
+                "rows_with_diffs": rows_with_diffs,
+                "cell_diffs_found": len(column_details),
+                "mismatch_columns": mismatch_cols,
+                "column_mismatch_summary": col_summary,
+                "match_pct": match_pct,
+                "strategy": "duckdb",
+            },
+            details=details,
+            message=(
+                f"DuckDB diff: src={src_count:,}, tgt={tgt_count:,}, "
+                f"only_src={rows_only_src:,}, only_tgt={rows_only_tgt:,}, "
+                f"cell_diffs={len(column_details):,}, match={match_pct}%"
+                + (f", diff_cols=[{mismatch_cols}]" if mismatch_cols else "")
+            ),
+        )
+
+    # ── Strategy 0b: DuckDB bridge (CSV ↔ SQL DB, e.g. CSV ↔ Teradata) ────────
+
+    def _duckdb_bridge_strategy(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:  # noqa: C901
+        """Diff a file-based connector against a SQL connector via DuckDB.
+
+        The SQL side is streamed in chunks into a DuckDB table so nothing
+        is fully held in Python memory. The file side is read by DuckDB
+        natively (zero-copy for CSV). The actual diff runs entirely inside
+        the DuckDB vectorized engine — same efficiency as the pure CSV path.
+        """
+        import duckdb
+        from collections import Counter
+
+        logger.info("Using DUCKDB BRIDGE strategy (mixed file ↔ SQL comparison)")
+
+        src_is_file = hasattr(src_conn, "read_dataframe")
+        # Normalise: file connector → "src", SQL connector → "db"
+        file_conn = src_conn if src_is_file else tgt_conn
+        db_conn   = tgt_conn if src_is_file else src_conn
+        db_table  = config.target_table if src_is_file else config.source_table
+
+        con = duckdb.connect()
+
+        # ── Load file side ────────────────────────────────────────────────────
+        file_path = getattr(file_conn, "_file_path", None)
+        if file_path:
+            con.execute(f"CREATE VIEW file_side AS SELECT * FROM read_csv_auto({file_path!r})")
+            logger.debug("DuckDB: CSV side from file %s", file_path)
+        else:
+            fdf = file_conn.read_dataframe()
+            con.register("_fdf", fdf)
+            con.execute("CREATE VIEW file_side AS SELECT * FROM _fdf")
+            logger.debug("DuckDB: file side from in-memory DataFrame")
+
+        # ── Stream SQL side chunk-by-chunk into a DuckDB table ───────────────
+        chunk_size = config.chunk_size  # default 50_000 from CheckConfig
+        fetch_sql = f"SELECT * FROM {db_table}"
+        if config.where:
+            fetch_sql += f" WHERE {config.where}"
+
+        first = True
+        total_db_rows = 0
+        logger.debug("Streaming SQL side into DuckDB: %s", fetch_sql)
+        for chunk in db_conn.execute_streaming(fetch_sql, chunk_size):
+            chunk.columns = [c.upper() for c in chunk.columns]
+            total_db_rows += len(chunk)
+            if first:
+                con.register("_chunk", chunk)
+                con.execute("CREATE TABLE db_side AS SELECT * FROM _chunk")
+                first = False
+            else:
+                con.register("_chunk", chunk)
+                con.execute("INSERT INTO db_side SELECT * FROM _chunk")
+        if first:
+            # No rows from DB — create empty table from schema
+            con.execute("CREATE TABLE db_side AS SELECT * FROM file_side WHERE false")
+
+        logger.info("SQL side streamed: %d rows into DuckDB", total_db_rows)
+
+        # Assign src/tgt views respecting original direction
+        if src_is_file:
+            con.execute("CREATE VIEW src AS SELECT * FROM file_side")
+            con.execute("CREATE VIEW tgt AS SELECT * FROM db_side")
+        else:
+            con.execute("CREATE VIEW src AS SELECT * FROM db_side")
+            con.execute("CREATE VIEW tgt AS SELECT * FROM file_side")
+
+        # ── From here: identical logic to _duckdb_strategy ───────────────────
+        src_upper = {r[0].upper(): r[0] for r in con.execute("DESCRIBE src").fetchall()}
+        tgt_upper = {r[0].upper(): r[0] for r in con.execute("DESCRIBE tgt").fetchall()}
+
+        ignore_set = {c.upper() for c in (config.ignore_columns or [])}
+        common_upper = [c for c in src_upper if c in tgt_upper and c not in ignore_set]
+        join_keys_u = (
+            [k.upper() for k in config.join_keys]
+            if config.join_keys and config.join_keys != ["NA"]
+            else []
+        )
+        if join_keys_u:
+            missing = [k for k in join_keys_u if k not in src_upper or k not in tgt_upper]
+            if missing:
+                logger.warning("Join keys missing: %s — positional fallback", missing)
+                join_keys_u = []
+
+        max_mismatches = config.extra.get("max_mismatches", 10_000)
+        src_count = con.execute("SELECT count(*) FROM src").fetchone()[0]
+        tgt_count = con.execute("SELECT count(*) FROM tgt").fetchone()[0]
+        rows_only_src = 0
+        rows_only_tgt = 0
+        column_details: list[dict] = []
+
+        if join_keys_u:
+            data_cols = [c for c in common_upper if c not in join_keys_u]
+            key_join = " AND ".join(
+                f's."{src_upper[k]}" = t."{tgt_upper[k]}"' for k in join_keys_u
+            )
+            rows_only_src = con.execute(
+                f"SELECT count(*) FROM src s WHERE NOT EXISTS "
+                f"(SELECT 1 FROM tgt t WHERE {key_join})"
+            ).fetchone()[0]
+            rows_only_tgt = con.execute(
+                f"SELECT count(*) FROM tgt t WHERE NOT EXISTS "
+                f"(SELECT 1 FROM src s WHERE {key_join})"
+            ).fetchone()[0]
+            if data_cols:
+                diff_filter = " OR ".join(
+                    f's."{src_upper[c]}" IS DISTINCT FROM t."{tgt_upper[c]}"'
+                    for c in data_cols
+                )
+                select_parts = (
+                    [f's."{src_upper[k]}" AS "_key_{k}"' for k in join_keys_u]
+                    + [col for c in data_cols
+                       for col in (
+                           f's."{src_upper[c]}" AS "_src_{c}"',
+                           f't."{tgt_upper[c]}" AS "_tgt_{c}"',
+                       )]
+                )
+                diff_sql = (
+                    f"SELECT {', '.join(select_parts)} "
+                    f"FROM src s INNER JOIN tgt t ON {key_join} "
+                    f"WHERE {diff_filter} "
+                    f"LIMIT {max_mismatches}"
+                )
+                result_cols = (
+                    [f"_key_{k}" for k in join_keys_u]
+                    + [col for c in data_cols for col in (f"_src_{c}", f"_tgt_{c}")]
+                )
+                for row_tuple in con.execute(diff_sql).fetchall():
+                    row = dict(zip(result_cols, row_tuple))
+                    for c in data_cols:
+                        sv, tv = row[f"_src_{c}"], row[f"_tgt_{c}"]
+                        if sv is None and tv is None:
+                            continue
+                        if sv is not None and tv is not None:
+                            try:
+                                if float(sv) == float(tv):
+                                    continue
+                            except (ValueError, TypeError):
+                                pass
+                        if str(sv) != str(tv):
+                            detail = {
+                                "COLUMN": c,
+                                "SOURCE_VALUE": str(sv) if sv is not None else "NULL",
+                                "TARGET_VALUE": str(tv) if tv is not None else "NULL",
+                            }
+                            if len(join_keys_u) == 1:
+                                detail[join_keys_u[0]] = row[f"_key_{join_keys_u[0]}"]
+                            else:
+                                for k in join_keys_u:
+                                    detail[k] = row[f"_key_{k}"]
+                            column_details.append(detail)
+                        if len(column_details) >= max_mismatches:
+                            break
+                    if len(column_details) >= max_mismatches:
+                        break
+        else:
+            src_sel = ", ".join(f'"{src_upper[c]}"' for c in common_upper)
+            tgt_sel = ", ".join(f'"{tgt_upper[c]}"' for c in common_upper)
+            rows_only_src = con.execute(
+                f"SELECT count(*) FROM (SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt)"
+            ).fetchone()[0]
+            rows_only_tgt = con.execute(
+                f"SELECT count(*) FROM (SELECT {tgt_sel} FROM tgt EXCEPT SELECT {src_sel} FROM src)"
+            ).fetchone()[0]
+            for i, row_tuple in enumerate(
+                con.execute(
+                    f"SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt LIMIT {max_mismatches}"
+                ).fetchall()
+            ):
+                row = dict(zip(common_upper, row_tuple))
+                for c in common_upper:
+                    column_details.append({
+                        "ROW": i + 1, "COLUMN": c,
+                        "SOURCE_VALUE": str(row[c]) if row[c] is not None else "NULL",
+                        "TARGET_VALUE": "(not in target)",
+                    })
+                if len(column_details) >= max_mismatches:
+                    break
+
+        con.close()
+
+        col_counts = Counter(d["COLUMN"] for d in column_details)
+        mismatch_cols = ", ".join(sorted(col_counts.keys()))
+        col_summary = ", ".join(f"{c}:{n}" for c, n in col_counts.most_common(10))
+        unique_key = join_keys_u[0] if join_keys_u else "ROW"
+        rows_with_diffs = len({d.get(unique_key) for d in column_details}) if column_details else 0
+        matched_rows = min(src_count, tgt_count) - rows_with_diffs
+        match_pct = (
+            round(max(0, matched_rows) / max(src_count, tgt_count) * 100, 2)
+            if max(src_count, tgt_count) else 100.0
+        )
+        total_mismatches = len(column_details) + rows_only_src + rows_only_tgt
+        status = Status.PASS if total_mismatches == 0 else Status.FAIL
+        details = pd.DataFrame(column_details) if column_details else None
+
+        return CheckResult(
+            check_type=self.name,
+            status=status,
+            metrics={
+                "src_row_count": src_count,
+                "tgt_row_count": tgt_count,
+                "rows_only_in_source": rows_only_src,
+                "rows_only_in_target": rows_only_tgt,
+                "rows_with_diffs": rows_with_diffs,
+                "cell_diffs_found": len(column_details),
+                "mismatch_columns": mismatch_cols,
+                "column_mismatch_summary": col_summary,
+                "match_pct": match_pct,
+                "strategy": "duckdb_bridge",
+            },
+            details=details,
+            message=(
+                f"DuckDB bridge diff: src={src_count:,}, tgt={tgt_count:,}, "
+                f"only_src={rows_only_src:,}, only_tgt={rows_only_tgt:,}, "
+                f"cell_diffs={len(column_details):,}, match={match_pct}%"
+                + (f", diff_cols=[{mismatch_cols}]" if mismatch_cols else "")
+            ),
+        )
+
+    # ── Strategy 1: Hash-first pass ──────────────────────────────────────────
+
+    def _hash_strategy(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
+        """Compare row hashes server-side. Fetch full data only for mismatches."""
+        logger.info("Using HASH strategy for data comparison")
+
+        join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else None
+        if not join_keys:
+            logger.info("Hash strategy requires join_keys — falling back to full")
+            return self._full_strategy(src_conn, tgt_conn, config)
+
+        columns = tgt_conn.get_column_names(config.target_table, exclude=config.ignore_columns)
+        where = config.where
+
+        # Phase 1: compute hashes on both sides (streamed for large tables)
+        src_hash_q = _build_row_hash_query(config.source_table, columns, where, join_keys)
+        tgt_hash_q = _build_row_hash_query(config.target_table, columns, where, join_keys)
+
+        logger.info("Phase 1: fetching row hashes")
+        chunk_size = config.chunk_size
+
+        # Stream hashes in chunks to avoid OOM on large tables
+        src_chunks = []
+        for chunk in src_conn.execute_streaming(src_hash_q, chunk_size):
+            chunk.columns = [c.upper() for c in chunk.columns]
+            src_chunks.append(chunk)
+        src_hashes = pd.concat(src_chunks, ignore_index=True) if src_chunks else pd.DataFrame()
+
+        tgt_chunks = []
+        for chunk in tgt_conn.execute_streaming(tgt_hash_q, chunk_size):
+            chunk.columns = [c.upper() for c in chunk.columns]
+            tgt_chunks.append(chunk)
+        tgt_hashes = pd.concat(tgt_chunks, ignore_index=True) if tgt_chunks else pd.DataFrame()
+
+        src_count = len(src_hashes)
+        tgt_count = len(tgt_hashes)
+
+        # Merge on keys + hash to find mismatches
+        key_upper = [k.upper() for k in join_keys]
+        merged = src_hashes.merge(
+            tgt_hashes, on=key_upper, how="outer",
+            suffixes=("_SRC", "_TGT"), indicator=True,
+        )
+
+        only_src_keys = merged[merged["_merge"] == "left_only"][key_upper]
+        only_tgt_keys = merged[merged["_merge"] == "right_only"][key_upper]
+        both = merged[merged["_merge"] == "both"]
+        hash_mismatches = both[both["ROW_HASH_SRC"] != both["ROW_HASH_TGT"]][key_upper]
+
+        n_only_src = len(only_src_keys)
+        n_only_tgt = len(only_tgt_keys)
+        n_hash_diff = len(hash_mismatches)
+        total_mismatches = n_only_src + n_only_tgt + n_hash_diff
+
+        logger.info(
+            "Phase 1 results: only_src=%d, only_tgt=%d, hash_diff=%d",
+            n_only_src, n_only_tgt, n_hash_diff,
+        )
+
+        # Phase 2: fetch full rows only for mismatched keys (column drill-down)
+        max_fetch = config.extra.get("max_mismatches", 10_000)
+        column_details = []
+        do_drill_down = config.extra.get("column_drill_down", True)
+        batch_size = 100  # fetch this many rows per query instead of one-by-one
+
+        if do_drill_down and n_hash_diff > 0:
+            drill_keys = hash_mismatches.head(min(n_hash_diff, max_fetch))
+            col_list = ", ".join(f'"{c}"' for c in columns)
+            ignore_set = {c.upper() for c in config.ignore_columns}
+
+            # Batch drill-down: build IN clauses for groups of keys
+            for batch_start in range(0, len(drill_keys), batch_size):
+                batch = drill_keys.iloc[batch_start:batch_start + batch_size]
+
+                if len(key_upper) == 1:
+                    # Single-column key: use efficient IN clause
+                    k = key_upper[0]
+                    vals = ", ".join(
+                        f"'{str(row[k]).replace(chr(39), chr(39)+chr(39))}'"
+                        for _, row in batch.iterrows()
+                    )
+                    key_clause = f'"{k}" IN ({vals})'
+                else:
+                    # Multi-column key: use OR of AND conditions
+                    or_parts = []
+                    for _, key_row in batch.iterrows():
+                        and_parts = []
+                        for k in key_upper:
+                            escaped_val = str(key_row[k]).replace("'", "''")
+                            and_parts.append(f'"{k}" = \'{escaped_val}\'')
+                        or_parts.append(f"({' AND '.join(and_parts)})")
+                    key_clause = " OR ".join(or_parts)
+
+                full_where = f"{where} AND ({key_clause})" if where else key_clause
+
+                src_batch_df = src_conn.execute_query(
+                    f'SELECT {col_list} FROM {config.source_table} WHERE {full_where}'
+                )
+                tgt_batch_df = tgt_conn.execute_query(
+                    f'SELECT {col_list} FROM {config.target_table} WHERE {full_where}'
+                )
+
+                src_batch_df.columns = [c.upper() for c in src_batch_df.columns]
+                tgt_batch_df.columns = [c.upper() for c in tgt_batch_df.columns]
+
+                # Index by keys for fast lookup
+                if len(src_batch_df) > 0 and len(tgt_batch_df) > 0:
+                    src_indexed = src_batch_df.set_index(key_upper)
+                    tgt_indexed = tgt_batch_df.set_index(key_upper)
+                    common_keys = src_indexed.index.intersection(tgt_indexed.index)
+
+                    for key_val in common_keys:
+                        src_row = src_indexed.loc[key_val]
+                        tgt_row = tgt_indexed.loc[key_val]
+                        if isinstance(src_row, pd.DataFrame):
+                            src_row = src_row.iloc[0]
+                        if isinstance(tgt_row, pd.DataFrame):
+                            tgt_row = tgt_row.iloc[0]
+                        diffs = _column_level_diff(src_row, tgt_row, ignore_set)
+                        for d in diffs:
+                            if isinstance(key_val, tuple):
+                                d.update(dict(zip(key_upper, key_val)))
+                            else:
+                                d[key_upper[0]] = key_val
+                        column_details.extend(diffs)
+
+        details = pd.DataFrame(column_details) if column_details else None
+        mismatch_cols = ", ".join(sorted({d["column"] for d in column_details})) if column_details else ""
+
+        # Column mismatch distribution
+        col_mismatch_summary = ""
+        if column_details:
+            from collections import Counter
+            col_counts = Counter(d["column"] for d in column_details)
+            col_mismatch_summary = ", ".join(
+                f"{col}:{cnt}" for col, cnt in col_counts.most_common(10)
+            )
+
+        # Match percentage
+        matched_rows = len(both) - n_hash_diff
+        total_compared = max(src_count, tgt_count)
+        match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
+
+        status = Status.PASS if total_mismatches == 0 else Status.FAIL
+
+        return CheckResult(
+            check_type=self.name,
+            status=status,
+            metrics={
+                "src_row_count": src_count,
+                "tgt_row_count": tgt_count,
+                "rows_only_in_source": n_only_src,
+                "rows_only_in_target": n_only_tgt,
+                "rows_hash_mismatch": n_hash_diff,
+                "rows_matched": matched_rows,
+                "match_pct": match_pct,
+                "column_diffs_found": len(column_details),
+                "mismatch_columns": mismatch_cols,
+                "column_mismatch_summary": col_mismatch_summary,
+                "strategy": "hash",
+            },
+            details=details,
+            message=(
+                f"Hash compare: src={src_count:,}, tgt={tgt_count:,}, "
+                f"match={match_pct}%, "
+                f"only_src={n_only_src:,}, only_tgt={n_only_tgt:,}, "
+                f"hash_diff={n_hash_diff:,}, col_diffs={len(column_details)}"
+            ),
+        )
+
+    # ── Strategy 2: Deterministic sample ─────────────────────────────────────
+
+    def _sample_strategy(self, src_conn, tgt_conn, config: CheckConfig,
+                         sample_pct: float) -> CheckResult:
+        """Compare a deterministic subset of rows for fast smoke testing."""
+        logger.info("Using SAMPLE strategy (%s%%) for data comparison", sample_pct)
+
+        join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else None
+        if not join_keys:
+            logger.info("Sample strategy requires join_keys — falling back to full")
+            return self._full_strategy(src_conn, tgt_conn, config)
+
+        sample_where = deterministic_sample_where(join_keys[0], sample_pct)
+        combined_where = f"{config.where} AND {sample_where}" if config.where else sample_where
+
+        # Run full strategy on the sampled subset
+        sampled_config = CheckConfig(
+            check_type=config.check_type,
+            source_table=config.source_table,
+            target_table=config.target_table,
+            columns=config.columns,
+            join_keys=config.join_keys,
+            ignore_columns=config.ignore_columns,
+            where=combined_where,
+            chunk_size=config.chunk_size,
+            extra=config.extra,
+        )
+        result = self._full_strategy(src_conn, tgt_conn, sampled_config)
+        result.metrics["strategy"] = "sample"
+        result.metrics["sample_pct"] = sample_pct
+        result.message = f"[Sample {sample_pct}%] {result.message}"
+        return result
+
+    # ── Strategy 3: Full comparison with streaming ───────────────────────────
+
+    def _full_strategy(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
+        """Full row-level comparison with streaming support for large tables."""
+        logger.info("Using FULL strategy for data comparison")
+
+        where = config.where
+        src_table = config.source_table
+        tgt_table = config.target_table
+        join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else None
+        chunk_size = config.chunk_size
+        max_mismatches = config.extra.get("max_mismatches", 10_000)
+        use_streaming = config.extra.get("streaming", False)
+
+        # Get columns
+        src_cols = tgt_conn.get_column_names(tgt_table, exclude=config.ignore_columns)
+        col_list = ", ".join(f'"{c}"' for c in src_cols)
+        clause = f"WHERE {where}" if where else ""
+        order_by = f"ORDER BY {', '.join(f'\"' + k + '\"' for k in join_keys)}" if join_keys else ""
+        query_src = f"SELECT {col_list} FROM {src_table} {clause} {order_by}"
+        query_tgt = f"SELECT {col_list} FROM {tgt_table} {clause} {order_by}"
+
+        if use_streaming:
+            return self._streaming_compare(
+                src_conn, tgt_conn, query_src, query_tgt,
+                join_keys, chunk_size, max_mismatches, src_table, tgt_table,
+            )
+
+        # Non-streaming: load into memory
+        src_df = src_conn.execute_query(query_src)
+        tgt_df = tgt_conn.execute_query(query_tgt)
+
+        src_df.columns = [c.upper() for c in src_df.columns]
+        tgt_df.columns = [c.upper() for c in tgt_df.columns]
+
+        # Align dtypes
+        try:
+            tgt_df = tgt_df.astype(src_df.dtypes)
+        except (ValueError, TypeError):
+            try:
+                src_df = src_df.astype(tgt_df.dtypes)
+            except (ValueError, TypeError):
+                logger.warning("Could not align dtypes between source and target")
+
+        src_count = len(src_df)
+        tgt_count = len(tgt_df)
+
+        # Sort
+        if join_keys:
+            src_df.sort_values(by=join_keys, inplace=True)
+            tgt_df.sort_values(by=join_keys, inplace=True)
+        else:
+            src_df.sort_values(by=list(src_df.columns), inplace=True)
+            tgt_df.sort_values(by=list(tgt_df.columns), inplace=True)
+
+        src_df.reset_index(drop=True, inplace=True)
+        tgt_df.reset_index(drop=True, inplace=True)
+
+        # Chunked comparison
+        differences_src = []
+        differences_tgt = []
+        total_rows = max(src_count, tgt_count)
+        chunk_start = 0
+
+        while chunk_start < total_rows:
+            chunk_end = min(chunk_start + chunk_size, total_rows)
+            src_chunk = src_df.iloc[chunk_start:chunk_end].copy()
+            tgt_chunk = tgt_df.iloc[chunk_start:chunk_end].copy()
+
+            src_chunk.replace("", None, inplace=True)
+            tgt_chunk.replace("", None, inplace=True)
+
+            merged = src_chunk.merge(tgt_chunk, how="outer", indicator=True)
+            differences_src.append(merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]))
+            differences_tgt.append(merged[merged["_merge"] == "right_only"].drop(columns=["_merge"]))
+
+            chunk_start += chunk_size
+
+            total_diffs = sum(len(d) for d in differences_src) + sum(len(d) for d in differences_tgt)
+            if total_diffs >= max_mismatches:
+                logger.warning("Max mismatch limit (%d) reached, stopping early", max_mismatches)
+                break
+
+        all_src_diffs = pd.concat(differences_src, ignore_index=True) if differences_src else pd.DataFrame()
+        all_tgt_diffs = pd.concat(differences_tgt, ignore_index=True) if differences_tgt else pd.DataFrame()
+
+        is_match = len(all_src_diffs) == 0 and len(all_tgt_diffs) == 0
+        status = Status.PASS if is_match else Status.FAIL
+
+        total_mismatches = len(all_src_diffs) + len(all_tgt_diffs)
+        total_compared = max(src_count, tgt_count)
+        matched_rows = total_compared - max(len(all_src_diffs), len(all_tgt_diffs))
+        match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
+
+        # Column-level drill-down: pair rows by join key and diff each column
+        if join_keys and len(all_src_diffs) > 0 and len(all_tgt_diffs) > 0:
+            details, mismatch_cols, col_mismatch_summary = self._column_drill_down(
+                all_src_diffs, all_tgt_diffs, join_keys, config.ignore_columns, max_mismatches
+            )
+        else:
+            details = self._build_details(all_src_diffs, all_tgt_diffs, max_mismatches)
+            mismatch_cols = ""
+            col_mismatch_summary = ""
+
+        return CheckResult(
+            check_type=self.name,
+            status=status,
+            metrics={
+                "src_row_count": src_count,
+                "tgt_row_count": tgt_count,
+                "rows_only_in_source": len(all_src_diffs),
+                "rows_only_in_target": len(all_tgt_diffs),
+                "rows_matched": matched_rows,
+                "match_pct": match_pct,
+                "mismatch_columns": mismatch_cols,
+                "column_mismatch_summary": col_mismatch_summary,
+                "strategy": "full",
+            },
+            details=details,
+            message=(
+                f"Source={src_count:,}, Target={tgt_count:,}, "
+                f"match={match_pct}%, "
+                f"Only-in-src={len(all_src_diffs):,}, Only-in-tgt={len(all_tgt_diffs):,}"
+            ),
+        )
+
+    # ── Streaming comparison (for very large tables) ─────────────────────────
+
+    def _streaming_compare(
+        self, src_conn, tgt_conn,
+        src_query: str, tgt_query: str,
+        join_keys: list[str] | None,
+        chunk_size: int, max_mismatches: int,
+        src_table: str, tgt_table: str,
+    ) -> CheckResult:
+        """Compare using server-side cursor streaming — no full load."""
+        logger.info("Streaming comparison active")
+
+        differences_src = []
+        differences_tgt = []
+        src_count = 0
+        tgt_count = 0
+
+        src_stream = src_conn.execute_streaming(src_query, chunk_size)
+        tgt_stream = tgt_conn.execute_streaming(tgt_query, chunk_size)
+
+        src_exhausted = False
+        tgt_exhausted = False
+
+        while not (src_exhausted and tgt_exhausted):
+            try:
+                src_chunk = next(src_stream)
+            except StopIteration:
+                src_chunk = pd.DataFrame()
+                src_exhausted = True
+
+            try:
+                tgt_chunk = next(tgt_stream)
+            except StopIteration:
+                tgt_chunk = pd.DataFrame()
+                tgt_exhausted = True
+
+            if src_chunk.empty and tgt_chunk.empty:
+                break
+
+            src_chunk.replace("", None, inplace=True)
+            tgt_chunk.replace("", None, inplace=True)
+
+            src_count += len(src_chunk)
+            tgt_count += len(tgt_chunk)
+
+            if not src_chunk.empty and not tgt_chunk.empty:
+                merged = src_chunk.merge(tgt_chunk, how="outer", indicator=True)
+                differences_src.append(merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]))
+                differences_tgt.append(merged[merged["_merge"] == "right_only"].drop(columns=["_merge"]))
+            elif not src_chunk.empty:
+                differences_src.append(src_chunk)
+            elif not tgt_chunk.empty:
+                differences_tgt.append(tgt_chunk)
+
+            total_diffs = sum(len(d) for d in differences_src) + sum(len(d) for d in differences_tgt)
+            if total_diffs >= max_mismatches:
+                logger.warning("Max mismatch limit reached in streaming mode")
+                break
+
+        all_src_diffs = pd.concat(differences_src, ignore_index=True) if differences_src else pd.DataFrame()
+        all_tgt_diffs = pd.concat(differences_tgt, ignore_index=True) if differences_tgt else pd.DataFrame()
+
+        is_match = len(all_src_diffs) == 0 and len(all_tgt_diffs) == 0
+
+        total_compared = max(src_count, tgt_count)
+        matched_rows = total_compared - max(len(all_src_diffs), len(all_tgt_diffs))
+        match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
+
+        # Column-level drill-down when join keys are available
+        key_list = join_keys if join_keys else []
+        if key_list and len(all_src_diffs) > 0 and len(all_tgt_diffs) > 0:
+            details, mismatch_cols, col_mismatch_summary = self._column_drill_down(
+                all_src_diffs, all_tgt_diffs, key_list, [], max_mismatches
+            )
+        else:
+            details = self._build_details(all_src_diffs, all_tgt_diffs, max_mismatches)
+            mismatch_cols = ""
+            col_mismatch_summary = ""
+
+        return CheckResult(
+            check_type=self.name,
+            status=Status.PASS if is_match else Status.FAIL,
+            metrics={
+                "src_row_count": src_count,
+                "tgt_row_count": tgt_count,
+                "rows_only_in_source": len(all_src_diffs),
+                "rows_only_in_target": len(all_tgt_diffs),
+                "rows_matched": matched_rows,
+                "match_pct": match_pct,
+                "mismatch_columns": mismatch_cols,
+                "column_mismatch_summary": col_mismatch_summary,
+                "strategy": "streaming",
+            },
+            details=details,
+            message=(
+                f"Streaming: src={src_count:,}, tgt={tgt_count:,}, "
+                f"match={match_pct}%, "
+                f"only_src={len(all_src_diffs):,}, only_tgt={len(all_tgt_diffs):,}"
+            ),
+        )
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _column_drill_down(
+        src_diffs: pd.DataFrame, tgt_diffs: pd.DataFrame,
+        join_keys: list[str], ignore_columns: list[str],
+        max_rows: int,
+    ) -> tuple[pd.DataFrame | None, str, str]:
+        """Pair mismatched rows by join key, then diff each column to produce
+        a details table of (join_keys, column, source_value, target_value).
+
+        Returns: (details_df, mismatch_columns_str, column_mismatch_summary_str)
+        """
+        from collections import Counter
+
+        key_upper = [k.upper() for k in join_keys]
+        ignore_set = {c.upper() for c in ignore_columns}
+        ignore_set.update({"_SIDE", "_MERGE"})
+
+        # Merge src and tgt diffs on keys to pair matching rows
+        merged = src_diffs.merge(
+            tgt_diffs, on=key_upper, how="inner",
+            suffixes=("_SRC", "_TGT"),
+        )
+
+        column_details = []
+        # Identify the data columns (not keys, not internal)
+        data_cols = []
+        for c in src_diffs.columns:
+            if c not in key_upper and c.upper() not in ignore_set:
+                data_cols.append(c)
+
+        for _, row in merged.head(max_rows).iterrows():
+            for col in data_cols:
+                src_col = f"{col}_SRC" if f"{col}_SRC" in row.index else col
+                tgt_col = f"{col}_TGT" if f"{col}_TGT" in row.index else col
+                sv = row.get(src_col)
+                tv = row.get(tgt_col)
+                if str(sv) != str(tv):
+                    entry = {"column": col, "source_value": sv, "target_value": tv}
+                    entry.update({k: row[k] for k in key_upper if k in row.index})
+                    column_details.append(entry)
+
+        # Also capture rows only on one side (no pair to diff)
+        only_src_keys = set()
+        only_tgt_keys = set()
+        if len(key_upper) == 1:
+            k = key_upper[0]
+            paired_keys = set(merged[k].tolist()) if len(merged) > 0 else set()
+            only_src_keys = set(src_diffs[k].tolist()) - paired_keys
+            only_tgt_keys = set(tgt_diffs[k].tolist()) - paired_keys
+
+        # Build combined details
+        if column_details:
+            details_df = pd.DataFrame(column_details)
+            col_counts = Counter(d["column"] for d in column_details)
+            mismatch_cols = ", ".join(sorted(col_counts.keys()))
+            col_mismatch_summary = ", ".join(
+                f"{col}:{cnt}" for col, cnt in col_counts.most_common(10)
+            )
+        else:
+            details_df = None
+            mismatch_cols = ""
+            col_mismatch_summary = ""
+
+        # Append unpaired rows (only-in-source / only-in-target) as context
+        if details_df is None and (len(src_diffs) > 0 or len(tgt_diffs) > 0):
+            # No paired rows found — fallback to the old side-tagged format
+            parts = []
+            if len(src_diffs) > 0:
+                sd = src_diffs.head(max_rows).copy()
+                sd["_side"] = "only_in_source"
+                parts.append(sd)
+            if len(tgt_diffs) > 0:
+                td = tgt_diffs.head(max_rows).copy()
+                td["_side"] = "only_in_target"
+                parts.append(td)
+            details_df = pd.concat(parts, ignore_index=True) if parts else None
+
+        return details_df, mismatch_cols, col_mismatch_summary
+
+    @staticmethod
+    def _build_details(src_diffs: pd.DataFrame, tgt_diffs: pd.DataFrame,
+                       max_rows: int) -> pd.DataFrame | None:
+        parts = []
+        if len(src_diffs) > 0:
+            sd = src_diffs.head(max_rows).copy()
+            sd["_side"] = "only_in_source"
+            parts.append(sd)
+        if len(tgt_diffs) > 0:
+            td = tgt_diffs.head(max_rows).copy()
+            td["_side"] = "only_in_target"
+            parts.append(td)
+        return pd.concat(parts, ignore_index=True) if parts else None

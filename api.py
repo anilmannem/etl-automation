@@ -1,0 +1,607 @@
+"""FastAPI backend for ETL Validator React UI."""
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import sqlite3
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import uuid
+
+import yaml
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from etl_validator.checks.base import CheckConfig, Status
+from etl_validator.connectors.base import ConnectionConfig
+from etl_validator.connectors.registry import get_connector
+from etl_validator.engine.executor import SuiteResult, execute_suite
+from etl_validator.engine.result_store import ResultStore
+from etl_validator.engine.suite_loader import load_suite
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
+log = logging.getLogger(__name__)
+
+app = FastAPI(title="ETL Validator API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── Connection Store (SQLite) ────────────────────────────────────────────────
+
+_CONN_DB = Path("etl_validator_connections.db")
+
+
+def _conn_db() -> sqlite3.Connection:
+    db = sqlite3.connect(str(_CONN_DB))
+    db.row_factory = sqlite3.Row
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            platform TEXT NOT NULL,
+            dsn TEXT DEFAULT '',
+            host TEXT DEFAULT '',
+            port INTEGER DEFAULT 0,
+            username TEXT DEFAULT '',
+            password TEXT DEFAULT '',
+            database_name TEXT DEFAULT '',
+            schema_name TEXT DEFAULT '',
+            file_path TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    db.commit()
+    return db
+
+
+# ── Pydantic Models ──────────────────────────────────────────────────────────
+
+class SavedConnection(BaseModel):
+    name: str
+    platform: str
+    dsn: str = ""
+    host: str = ""
+    port: int = 0
+    username: str = ""
+    password: str = ""
+    database_name: str = ""
+    schema_name: str = ""
+    file_path: str = ""
+
+
+class CheckSpec(BaseModel):
+    type: str
+    strategy: str = "hash"
+    sample_pct: float = 10.0
+    column_drill_down: bool = True
+    join_keys: list[str] = []
+    columns: list[str] = []
+    functions: list[str] = ["MIN", "MAX", "AVG", "SUM"]
+
+
+class AdhocRequest(BaseModel):
+    source_connection_id: int | None = None
+    source_file_path: str = ""
+    source_table: str = ""
+    target_connection_id: int | None = None
+    target_file_path: str = ""
+    target_table: str = ""
+    checks: list[CheckSpec]
+    where: str = ""
+    suite_name: str = ""
+    parallel: bool = False
+    max_workers: int = 4
+    fail_fast: bool = False
+    batch_id: str = ""
+
+
+class HistoryQuery(BaseModel):
+    suite: str = ""
+    days: int = 30
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _suite_result_to_dict(result: SuiteResult) -> dict:
+    """Serialize SuiteResult to JSON-safe dict."""
+    summary = result.summary_dict()
+    checks = []
+    for r in result.results:
+        check_dict = {
+            "check_type": r.check_type,
+            "status": str(r.status),
+            "message": r.message,
+            "metrics": r.metrics,
+        }
+        if r.details is not None and len(r.details) > 0:
+            check_dict["details"] = json.loads(
+                r.details.head(100).to_json(orient="records")
+            )
+            check_dict["details_total"] = len(r.details)
+        else:
+            check_dict["details"] = []
+            check_dict["details_total"] = 0
+        checks.append(check_dict)
+
+    timings = []
+    for t in result.timings:
+        timings.append({
+            "check_type": t.check_type,
+            "duration_s": round(t.duration_s, 3),
+        })
+
+    return {
+        "run_id": result.run_id,
+        "suite_name": result.suite_name,
+        "summary": summary,
+        "checks": checks,
+        "timings": timings,
+    }
+
+
+def _get_saved_connection(conn_id: int) -> dict:
+    """Fetch a saved connection by ID."""
+    db = _conn_db()
+    row = db.execute("SELECT * FROM connections WHERE id = ?", (conn_id,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Connection {conn_id} not found")
+    return dict(row)
+
+
+def _config_from_saved(conn: dict) -> ConnectionConfig:
+    """Build a ConnectionConfig from a saved connection dict."""
+    platform = conn["platform"].lower()
+    if platform == "csv":
+        return ConnectionConfig(platform="csv", extra={"file_path": conn["file_path"]})
+    return ConnectionConfig(
+        platform=platform,
+        dsn=conn["dsn"],
+        host=conn["host"],
+        port=conn["port"],
+        user=conn["username"],
+        password=conn["password"],
+        database=conn["database_name"],
+        schema=conn["schema_name"],
+    )
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+
+
+# ── Connection Management ────────────────────────────────────────────────────
+
+@app.get("/api/connections")
+def list_connections():
+    """List all saved connections (passwords masked)."""
+    db = _conn_db()
+    rows = db.execute("SELECT * FROM connections ORDER BY name").fetchall()
+    db.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["password"] = "••••••••" if d["password"] else ""
+        result.append(d)
+    return result
+
+
+@app.post("/api/connections")
+def create_connection(conn: SavedConnection):
+    """Create a new saved connection."""
+    db = _conn_db()
+    try:
+        db.execute(
+            """INSERT INTO connections (name, platform, dsn, host, port, username, password,
+               database_name, schema_name, file_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (conn.name, conn.platform.lower(), conn.dsn, conn.host, conn.port,
+             conn.username, conn.password, conn.database_name, conn.schema_name,
+             conn.file_path),
+        )
+        db.commit()
+        row_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db.close()
+        return {"id": row_id, "name": conn.name, "message": "Connection created"}
+    except sqlite3.IntegrityError:
+        db.close()
+        raise HTTPException(status_code=409, detail=f"Connection '{conn.name}' already exists")
+
+
+@app.put("/api/connections/{conn_id}")
+def update_connection(conn_id: int, conn: SavedConnection):
+    """Update a saved connection."""
+    db = _conn_db()
+    existing = db.execute("SELECT id FROM connections WHERE id = ?", (conn_id,)).fetchone()
+    if not existing:
+        db.close()
+        raise HTTPException(status_code=404, detail="Connection not found")
+    db.execute(
+        """UPDATE connections SET name=?, platform=?, dsn=?, host=?, port=?, username=?,
+           password=?, database_name=?, schema_name=?, file_path=?,
+           updated_at=datetime('now')
+           WHERE id=?""",
+        (conn.name, conn.platform.lower(), conn.dsn, conn.host, conn.port,
+         conn.username, conn.password, conn.database_name, conn.schema_name,
+         conn.file_path, conn_id),
+    )
+    db.commit()
+    db.close()
+    return {"id": conn_id, "message": "Connection updated"}
+
+
+@app.delete("/api/connections/{conn_id}")
+def delete_connection(conn_id: int):
+    """Delete a saved connection."""
+    db = _conn_db()
+    db.execute("DELETE FROM connections WHERE id = ?", (conn_id,))
+    db.commit()
+    db.close()
+    return {"message": "Connection deleted"}
+
+
+@app.post("/api/connections/test")
+def test_connection(conn: SavedConnection):
+    """Test a connection without saving it."""
+    try:
+        config = _config_from_saved({
+            "platform": conn.platform, "dsn": conn.dsn, "host": conn.host,
+            "port": conn.port, "username": conn.username, "password": conn.password,
+            "database_name": conn.database_name, "schema_name": conn.schema_name,
+            "file_path": conn.file_path,
+        })
+        connector = get_connector(conn.platform.lower(), config)
+        connector.connect()
+        alive = connector.is_alive()
+        connector.close()
+        return {"success": alive, "message": "Connection successful" if alive else "Connection failed"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.post("/api/connections/{conn_id}/test")
+def test_saved_connection(conn_id: int):
+    """Test an existing saved connection."""
+    saved = _get_saved_connection(conn_id)
+    try:
+        config = _config_from_saved(saved)
+        connector = get_connector(saved["platform"].lower(), config)
+        connector.connect()
+        alive = connector.is_alive()
+        connector.close()
+        return {"success": alive, "message": "Connection successful" if alive else "Connection failed"}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+# ── CSV Upload ────────────────────────────────────────────────────────────────
+
+_UPLOAD_DIR = Path(tempfile.gettempdir()) / "etl_validator_uploads"
+_UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+@app.post("/api/upload-csv")
+async def upload_csv(file: UploadFile = File(...)):
+    """Accept a CSV file upload and return the temp path."""
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are accepted")
+    safe_name = f"{uuid.uuid4().hex}_{file.filename}"
+    dest = _UPLOAD_DIR / safe_name
+    content = await file.read()
+    dest.write_bytes(content)
+    return {"file_path": str(dest), "filename": file.filename, "size": len(content)}
+
+
+# ── Ad-hoc Test ──────────────────────────────────────────────────────────────
+
+def _csv_conn_dict(file_path: str) -> dict:
+    """Build a pseudo-connection dict for an uploaded CSV file."""
+    return {
+        "platform": "csv", "dsn": "", "host": "", "port": 0,
+        "username": "", "password": "", "database_name": "",
+        "schema_name": "", "file_path": file_path,
+    }
+
+
+@app.post("/api/adhoc/run")
+def run_adhoc(req: AdhocRequest):
+    """Run ad-hoc checks using saved connections or uploaded CSV files."""
+    try:
+        # Resolve connections — use uploaded file path or saved connection
+        if req.source_file_path:
+            src_conn = _csv_conn_dict(req.source_file_path)
+        else:
+            src_conn = _get_saved_connection(req.source_connection_id)
+        if req.target_file_path:
+            tgt_conn = _csv_conn_dict(req.target_file_path)
+        else:
+            tgt_conn = _get_saved_connection(req.target_connection_id)
+
+        checks = []
+        for c in req.checks:
+            check_dict: dict[str, Any] = {"type": c.type}
+            if c.type == "data":
+                check_dict["strategy"] = c.strategy
+                check_dict["column_drill_down"] = c.column_drill_down
+                if c.strategy == "sample":
+                    check_dict["sample_pct"] = c.sample_pct
+                if c.join_keys:
+                    check_dict["join_keys"] = c.join_keys
+            if c.type == "aggregate" and c.functions:
+                check_dict["functions"] = c.functions
+            checks.append(check_dict)
+
+        suite_data = {
+            "test_suite": req.suite_name.strip() or "adhoc",
+            "source": {
+                "platform": src_conn["platform"],
+                "table": req.source_table,
+                "dsn": src_conn["dsn"],
+                "host": src_conn["host"],
+                "port": src_conn["port"],
+                "user": src_conn["username"],
+                "password": src_conn["password"],
+                "database": src_conn["database_name"],
+                "schema": src_conn["schema_name"],
+                **({"extra": {"file_path": src_conn["file_path"]}} if src_conn["platform"] == "csv" else {}),
+            },
+            "target": {
+                "platform": tgt_conn["platform"],
+                "table": req.target_table,
+                "dsn": tgt_conn["dsn"],
+                "host": tgt_conn["host"],
+                "port": tgt_conn["port"],
+                "user": tgt_conn["username"],
+                "password": tgt_conn["password"],
+                "database": tgt_conn["database_name"],
+                "schema": tgt_conn["schema_name"],
+                **({"extra": {"file_path": tgt_conn["file_path"]}} if tgt_conn["platform"] == "csv" else {}),
+            },
+            "checks": checks,
+        }
+        if req.where:
+            suite_data["filters"] = {"where": req.where}
+
+        with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
+            yaml.dump(suite_data, f)
+            temp_path = f.name
+
+        suite = load_suite(temp_path)
+        result = execute_suite(
+            suite,
+            parallel=req.parallel,
+            max_workers=req.max_workers,
+            fail_fast=req.fail_fast,
+        )
+
+        rs = ResultStore()
+        src_label = req.source_file_path or req.source_table
+        tgt_label = req.target_file_path or req.target_table
+        rs.record_suite(result, batch_id=req.batch_id,
+                        source=src_label, target=tgt_label)
+        rs.close()
+
+        return _suite_result_to_dict(result)
+
+    except Exception as e:
+        log.exception("Ad-hoc run failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── History ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/history/batch/{batch_id}")
+def get_batch_detail(batch_id: str):
+    """Reconstruct a consolidated suite result for a batch."""
+    rs = ResultStore()
+    rows = rs.get_batch(batch_id)
+    rs.close()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found")
+
+    # Group rows by run_id (each run_id = one test case)
+    from collections import OrderedDict
+    tc_map = OrderedDict()
+    for row in rows:
+        rid = row["run_id"]
+        if rid not in tc_map:
+            tc_map[rid] = {
+                "run_id": rid,
+                "source": row.get("source", ""),
+                "target": row.get("target", ""),
+                "checks": [],
+                "passed": 0, "failed": 0, "errors": 0,
+                "duration_s": 0.0,
+            }
+        metrics = json.loads(row["metrics_json"]) if row["metrics_json"] else {}
+        details = json.loads(row["details_json"]) if row["details_json"] else []
+        status = row["status"]
+        dur = row.get("duration_s") or 0.0
+        tc_map[rid]["duration_s"] += dur
+        if status == "Pass":
+            tc_map[rid]["passed"] += 1
+        elif status == "Fail":
+            tc_map[rid]["failed"] += 1
+        else:
+            tc_map[rid]["errors"] += 1
+        tc_map[rid]["checks"].append({
+            "check_type": row["check_type"],
+            "status": status,
+            "message": row["message"] or "",
+            "metrics": metrics,
+            "details": details,
+            "details_total": len(details),
+        })
+
+    test_cases = []
+    total_checks = passed_checks = failed_checks = error_checks = 0
+    total_duration = 0.0
+    for idx, (rid, p) in enumerate(tc_map.items()):
+        total = len(p["checks"])
+        quality = round((p["passed"] / total) * 100, 1) if total else 0
+        tc_status = "Error" if p["errors"] else ("Fail" if p["failed"] else "Pass")
+        test_cases.append({
+            "index": idx + 1,
+            "source_label": p["source"] or "",
+            "target_label": p["target"] or "",
+            "status": tc_status,
+            "result": {
+                "run_id": rid,
+                "suite_name": rows[0]["suite"],
+                "summary": {
+                    "total": total,
+                    "passed": p["passed"],
+                    "failed": p["failed"],
+                    "errors": p["errors"],
+                    "quality_score": quality,
+                    "overall_status": tc_status,
+                    "duration_s": round(p["duration_s"], 2),
+                },
+                "checks": p["checks"],
+                "timings": [{"check_type": c["check_type"], "duration_s": 0} for c in p["checks"]],
+            },
+        })
+        total_checks += total
+        passed_checks += p["passed"]
+        failed_checks += p["failed"]
+        error_checks += p["errors"]
+        total_duration += p["duration_s"]
+
+    passed_tcs = sum(1 for p in test_cases if p["status"] == "Pass")
+    failed_tcs = sum(1 for p in test_cases if p["status"] == "Fail")
+    error_tcs = sum(1 for p in test_cases if p["status"] == "Error")
+    overall = "Fail" if (failed_tcs > 0 or error_tcs > 0) else "Pass"
+    quality_score = round((passed_checks / total_checks) * 100) if total_checks else 0
+
+    return {
+        "type": "suite",
+        "batch_id": batch_id,
+        "suite_name": rows[0]["suite"],
+        "started_at": rows[0]["timestamp"],
+        "duration_s": round(total_duration, 2),
+        "summary": {
+            "total_test_cases": len(test_cases),
+            "passed_test_cases": passed_tcs,
+            "failed_test_cases": failed_tcs,
+            "error_test_cases": error_tcs,
+            "total_checks": total_checks,
+            "passed_checks": passed_checks,
+            "failed_checks": failed_checks,
+            "error_checks": error_checks,
+            "quality_score": quality_score,
+            "overall_status": overall,
+        },
+        "test_cases": test_cases,
+    }
+
+
+@app.get("/api/history/{run_id}")
+def get_run_detail(run_id: str):
+    """Reconstruct a full result for a past run from stored check rows."""
+    rs = ResultStore()
+    rows = rs.get_run(run_id)
+    rs.close()
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    checks = []
+    total_duration = 0.0
+    passed = failed = errors = 0
+    for row in rows:
+        metrics = json.loads(row["metrics_json"]) if row["metrics_json"] else {}
+        details = json.loads(row["details_json"]) if row["details_json"] else []
+        status = row["status"]
+        if status == "Pass":
+            passed += 1
+        elif status == "Fail":
+            failed += 1
+        else:
+            errors += 1
+        dur = row.get("duration_s") or 0.0
+        total_duration += dur
+        checks.append({
+            "check_type": row["check_type"],
+            "status": status,
+            "message": row["message"] or "",
+            "metrics": metrics,
+            "details": details,
+            "details_total": len(details),
+        })
+
+    total = len(checks)
+    quality_score = round((passed / total) * 100, 1) if total else 100.0
+    overall_status = "Error" if errors else ("Fail" if failed else "Pass")
+    timings = [{"check_type": c["check_type"], "duration_s": round(rows[i].get("duration_s") or 0.0, 3)} for i, c in enumerate(checks)]
+
+    return {
+        "run_id": run_id,
+        "suite_name": rows[0]["suite"],
+        "summary": {
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "quality_score": quality_score,
+            "overall_status": overall_status,
+            "duration_s": round(total_duration, 2),
+        },
+        "checks": checks,
+        "timings": timings,
+    }
+
+
+@app.get("/api/history")
+def get_history(suite: str = "", days: int = 30):
+    """Get test result history."""
+    rs = ResultStore()
+    df = rs.get_history(suite or None, days)
+    rs.close()
+    if df.empty:
+        return {"results": [], "trend": [], "score_trend": []}
+
+    records = json.loads(df.to_json(orient="records"))
+
+    # Build daily trend
+    trend_df = df.copy()
+    trend_df["day"] = pd.to_datetime(trend_df["timestamp"]).dt.date.astype(str)
+    daily = trend_df.groupby("day").size().reset_index(name="count")
+    trend = json.loads(daily.to_json(orient="records"))
+
+    # Build daily quality score trend (MC-style: passed/total per day)
+    day_stats = trend_df.groupby("day").apply(
+        lambda g: pd.Series({
+            "quality_score": round((g["status"] == "Pass").sum() / len(g) * 100, 1) if len(g) > 0 else 100.0,
+            "total": len(g),
+            "passed": (g["status"] == "Pass").sum(),
+            "failed": (g["status"] == "Fail").sum(),
+        })
+    ).reset_index()
+    score_trend = json.loads(day_stats.to_json(orient="records"))
+
+    return {
+        "results": records,
+        "trend": trend,
+        "score_trend": score_trend,
+    }
+
+
+
