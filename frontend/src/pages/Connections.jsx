@@ -10,6 +10,7 @@ import DeleteRoundedIcon from '@mui/icons-material/DeleteRounded';
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
 import CableRoundedIcon from '@mui/icons-material/CableRounded';
 import StorageRoundedIcon from '@mui/icons-material/StorageRounded';
+import FolderOpenRoundedIcon from '@mui/icons-material/FolderOpenRounded';
 import WifiTetheringRoundedIcon from '@mui/icons-material/WifiTetheringRounded';
 import { EmptyState } from '../components/Shared';
 import {
@@ -20,6 +21,7 @@ import {
 const EMPTY_CONN = {
   name: '', platform: 'teradata', dsn: '', host: '', port: 0,
   username: '', password: '', database_name: '', schema_name: '',
+  file_path: '',
 };
 
 const PLATFORM_META = {
@@ -29,6 +31,13 @@ const PLATFORM_META = {
     gradient: 'linear-gradient(135deg, #EA580C, #FB923C)',
     glow: 'rgba(249,115,22,0.25)',
     Icon: StorageRoundedIcon,
+  },
+  csv: {
+    label: 'CSV / Shared Path',
+    color: '#0D9488',
+    gradient: 'linear-gradient(135deg, #0F766E, #14B8A6)',
+    glow: 'rgba(13,148,136,0.25)',
+    Icon: FolderOpenRoundedIcon,
   },
 };
 
@@ -105,6 +114,12 @@ function ConnectionCard({ conn, onEdit, onDelete, onTest }) {
 
         {/* Connection details */}
         <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.75, mb: 2.5 }}>
+          {conn.file_path && (
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+              <Typography sx={{ fontSize: '0.68rem', fontWeight: 600, color: '#CBD5E1', textTransform: 'uppercase', letterSpacing: '0.05em', minWidth: 44 }}>Path</Typography>
+              <Typography sx={{ fontSize: '0.75rem', color: '#475569', fontFamily: 'monospace' }} noWrap>{conn.file_path}</Typography>
+            </Box>
+          )}
           {conn.host && (
             <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
               <Typography sx={{ fontSize: '0.68rem', fontWeight: 600, color: '#CBD5E1', textTransform: 'uppercase', letterSpacing: '0.05em', minWidth: 44 }}>Host</Typography>
@@ -203,14 +218,14 @@ export default function Connections() {
 
   const fetchConnections = () => {
     setLoading(true);
-    listConnections().then((r) => setConnections((r.data || []).filter(c => c.platform !== 'csv'))).catch(() => setConnections([])).finally(() => setLoading(false));
+    listConnections().then((r) => setConnections(r.data || [])).catch(() => setConnections([])).finally(() => setLoading(false));
   };
   useEffect(() => { fetchConnections(); }, []);
 
   const openCreate = () => { setEditing(null); setForm({ ...EMPTY_CONN }); setTestResult(null); setError(''); setDialogOpen(true); };
   const openEdit = (conn) => {
     setEditing(conn.id);
-    setForm({ name: conn.name, platform: conn.platform, dsn: conn.dsn || '', host: conn.host || '', port: conn.port || 0, username: conn.username || '', password: '', database_name: conn.database_name || '', schema_name: conn.schema_name || '' });
+    setForm({ name: conn.name, platform: conn.platform, dsn: conn.dsn || '', host: conn.host || '', port: conn.port || 0, username: conn.username || '', password: '', database_name: conn.database_name || '', schema_name: conn.schema_name || '', file_path: conn.file_path || '' });
     setTestResult(null); setError(''); setDialogOpen(true);
   };
   const handleDelete = async (id) => { try { await deleteConnection(id); fetchConnections(); } catch (err) { setError(err.response?.data?.detail || 'Delete failed'); } };
@@ -316,8 +331,19 @@ export default function Connections() {
               <InputLabel>Platform</InputLabel>
               <Select value={form.platform} onChange={(e) => updateField('platform', e.target.value)} label="Platform">
                 <MenuItem value="teradata">Teradata</MenuItem>
+                <MenuItem value="csv">CSV / Shared Path</MenuItem>
               </Select>
             </FormControl>
+            {form.platform === 'csv' ? (
+              <TextField
+                fullWidth size="small"
+                label="Shared / Network Path"
+                value={form.file_path}
+                onChange={(e) => updateField('file_path', e.target.value)}
+                placeholder="/mnt/shared/data/ or \\\\server\\share\\folder"
+                helperText="Directory path on a shared/network drive accessible to the server"
+              />
+            ) : (
               <>
                 <TextField fullWidth size="small" label="DSN (optional)" value={form.dsn} onChange={(e) => updateField('dsn', e.target.value)} />
                 <Grid container spacing={2}>
@@ -345,6 +371,7 @@ export default function Connections() {
                   </Grid>
                 </Grid>
               </>
+            )}
 
           </Box>
         </DialogContent>

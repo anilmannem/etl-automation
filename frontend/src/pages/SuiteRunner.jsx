@@ -63,6 +63,8 @@ export default function SuiteRunner({ onResult }) {
   const [suiteName, setSuiteName] = useState('');
   const [srcConnectionId, setSrcConnectionId] = useState(null);
   const [tgtConnectionId, setTgtConnectionId] = useState(null);
+  const [srcConnection, setSrcConnection] = useState(null);
+  const [tgtConnection, setTgtConnection] = useState(null);
   const [pairs, setPairs] = useState([]);
   const [uploadError, setUploadError] = useState('');
   const [uploadedFile, setUploadedFile] = useState(null);
@@ -79,13 +81,17 @@ export default function SuiteRunner({ onResult }) {
   const [progress, setProgress] = useState(null);
   const [error, setError] = useState('');
 
-  const srcIsCsv = srcConnectionId === '__csv__';
-  const tgtIsCsv = tgtConnectionId === '__csv__';
+  const srcIsCsv = srcConnectionId === '__csv__' || srcConnection?.platform === 'csv';
+  const tgtIsCsv = tgtConnectionId === '__csv__' || tgtConnection?.platform === 'csv';
 
-  const srcLabel = srcIsCsv ? 'Source Path' : 'Source Query';
-  const tgtLabel = tgtIsCsv ? 'Target Path' : 'Target Query';
-  const srcPlaceholder = srcIsCsv ? '/path/to/source.csv' : 'SELECT * FROM stg.orders';
-  const tgtPlaceholder = tgtIsCsv ? '/path/to/target.csv' : 'SELECT * FROM prod.orders';
+  const srcLabel = srcIsCsv ? 'Source File Path' : 'Source Query';
+  const tgtLabel = tgtIsCsv ? 'Target File Path' : 'Target Query';
+  const srcPlaceholder = srcIsCsv
+    ? (srcConnection?.file_path ? `filename.csv (relative to ${srcConnection.file_path})` : '/path/to/source.csv')
+    : 'SELECT * FROM stg.orders';
+  const tgtPlaceholder = tgtIsCsv
+    ? (tgtConnection?.file_path ? `filename.csv (relative to ${tgtConnection.file_path})` : '/path/to/target.csv')
+    : 'SELECT * FROM prod.orders';
 
   const toggleCheck = (type) => setChecks((p) => p.includes(type) ? p.filter((t) => t !== type) : [...p, type]);
 
@@ -150,10 +156,26 @@ export default function SuiteRunner({ onResult }) {
           ? checkSpecs.map((s) => s.type === 'data' ? { ...s, join_keys: pair.keyCols.split(',').map((k) => k.trim()) } : s)
           : checkSpecs;
         const payload = { checks: pairChecks, suite_name: suiteName.trim(), parallel, max_workers: workers, fail_fast: failFast, batch_id: batchId };
-        if (srcIsCsv) { payload.source_file_path = pair.srcQuery.trim(); payload.source_table = 'SELECT * FROM data'; }
-        else { payload.source_connection_id = srcConnectionId; payload.source_table = pair.srcQuery.trim(); }
-        if (tgtIsCsv) { payload.target_file_path = pair.tgtQuery.trim(); payload.target_table = 'SELECT * FROM data'; }
-        else { payload.target_connection_id = tgtConnectionId; payload.target_table = pair.tgtQuery.trim(); }
+
+        // Resolve file paths: saved CSV connections prepend their base path
+        const resolvePath = (conn, rawPath) => {
+          if (conn?.platform === 'csv' && conn.file_path && conn.id !== '__csv__') {
+            const base = conn.file_path.replace(/\/+$/, '');
+            return rawPath.startsWith('/') || rawPath.startsWith('\\') ? rawPath : `${base}/${rawPath}`;
+          }
+          return rawPath;
+        };
+
+        if (srcIsCsv) {
+          payload.source_file_path = resolvePath(srcConnection, pair.srcQuery.trim());
+          payload.source_table = 'SELECT * FROM data';
+          if (srcConnection?.id && srcConnection.id !== '__csv__') payload.source_connection_id = srcConnection.id;
+        } else { payload.source_connection_id = srcConnectionId; payload.source_table = pair.srcQuery.trim(); }
+        if (tgtIsCsv) {
+          payload.target_file_path = resolvePath(tgtConnection, pair.tgtQuery.trim());
+          payload.target_table = 'SELECT * FROM data';
+          if (tgtConnection?.id && tgtConnection.id !== '__csv__') payload.target_connection_id = tgtConnection.id;
+        } else { payload.target_connection_id = tgtConnectionId; payload.target_table = pair.tgtQuery.trim(); }
         const res = await runAdhoc(payload);
         pairResults.push({
           index: i + 1,
@@ -287,14 +309,14 @@ export default function SuiteRunner({ onResult }) {
                   <StorageRoundedIcon sx={{ color: '#3171D6', fontSize: 12 }} />
                   <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#3171D6', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Source</Typography>
                 </Box>
-                <ConnectionPicker label="Source" value={srcConnectionId} onChange={setSrcConnectionId} />
+                <ConnectionPicker label="Source" value={srcConnectionId} onChange={setSrcConnectionId} onConnectionChange={setSrcConnection} />
               </Box>
               <Box>
                 <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, mb: 0.75 }}>
                   <CompareArrowsRoundedIcon sx={{ color: '#0D9488', fontSize: 12 }} />
                   <Typography sx={{ fontSize: '0.68rem', fontWeight: 700, color: '#0D9488', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Target</Typography>
                 </Box>
-                <ConnectionPicker label="Target" value={tgtConnectionId} onChange={setTgtConnectionId} />
+                <ConnectionPicker label="Target" value={tgtConnectionId} onChange={setTgtConnectionId} onConnectionChange={setTgtConnection} />
               </Box>
             </Box>
           </Box>

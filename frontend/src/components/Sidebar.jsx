@@ -55,7 +55,7 @@ export default function Sidebar() {
         width: '100%', pt: 1.5, pb: 1.5,
       }}>
       {/* App logo — top, clickable to home */}
-      <Tooltip title="ETL Validator" placement="right" arrow>
+      <Tooltip title="ETL Automation" placement="right" arrow>
         <Box
           onClick={() => navigate('/')}
           sx={{
