@@ -73,6 +73,9 @@ class DataCheck(BaseCheck):
     - ``full``: fetch all data and compare in chunks (original approach)
     - ``sample``: deterministic sample comparison for smoke testing
 
+    Auto-detects join keys when none are provided by finding columns that
+    are unique in both source and target datasets.
+
     YAML config::
 
         - type: data
@@ -83,6 +86,223 @@ class DataCheck(BaseCheck):
           column_drill_down: true
     """
     name = "data"
+
+    # ── Auto-detect key columns ──────────────────────────────────────────────
+
+    @staticmethod
+    def _auto_detect_keys_duckdb(con, src_upper, tgt_upper, common_upper):
+        """Auto-detect columns suitable as join keys in a DuckDB connection.
+
+        Checks for single columns (then column pairs) that have all-unique,
+        non-null values in both source and target.  Prioritises columns with
+        key-like names (id, _key, _pk, etc.) so the most likely candidate is
+        tested first.
+        """
+        src_count = con.execute("SELECT count(*) FROM src").fetchone()[0]
+        tgt_count = con.execute("SELECT count(*) FROM tgt").fetchone()[0]
+        if src_count == 0 or tgt_count == 0:
+            return []
+
+        def _key_priority(col):
+            cl = col.lower()
+            if cl == "id" or cl.endswith("_id") or cl.endswith("_key") or cl.endswith("_pk"):
+                return 0
+            if "id" in cl or "key" in cl or "code" in cl or "num" in cl:
+                return 1
+            return 2
+
+        sorted_cols = sorted(common_upper, key=_key_priority)
+
+        # Phase 1: single columns
+        for col in sorted_cols:
+            try:
+                src_ok = con.execute(
+                    f'SELECT count(DISTINCT "{src_upper[col]}") = count(*) '
+                    f'AND count("{src_upper[col]}") = count(*) FROM src'
+                ).fetchone()[0]
+                if not src_ok:
+                    continue
+                tgt_ok = con.execute(
+                    f'SELECT count(DISTINCT "{tgt_upper[col]}") = count(*) '
+                    f'AND count("{tgt_upper[col]}") = count(*) FROM tgt'
+                ).fetchone()[0]
+                if tgt_ok:
+                    logger.info("Auto-detected key column: %s", col)
+                    return [col]
+            except Exception:
+                continue
+
+        # Phase 2: column pairs (limit search space)
+        for i, c1 in enumerate(sorted_cols[:10]):
+            for c2 in sorted_cols[i + 1 : 10]:
+                try:
+                    src_ok = con.execute(
+                        f'SELECT count(*) FROM '
+                        f'(SELECT DISTINCT "{src_upper[c1]}", "{src_upper[c2]}" FROM src)'
+                    ).fetchone()[0] == src_count
+                    if not src_ok:
+                        continue
+                    tgt_ok = con.execute(
+                        f'SELECT count(*) FROM '
+                        f'(SELECT DISTINCT "{tgt_upper[c1]}", "{tgt_upper[c2]}" FROM tgt)'
+                    ).fetchone()[0] == tgt_count
+                    if tgt_ok:
+                        logger.info("Auto-detected composite key: [%s, %s]", c1, c2)
+                        return [c1, c2]
+                except Exception:
+                    continue
+
+        logger.info("No key columns auto-detected")
+        return []
+
+    @staticmethod
+    def _auto_detect_keys_df(src_df, tgt_df):
+        """Auto-detect join key columns from pandas DataFrames."""
+        common_cols = [c for c in src_df.columns if c in tgt_df.columns]
+        src_count = len(src_df)
+        tgt_count = len(tgt_df)
+        if src_count == 0 or tgt_count == 0:
+            return None
+
+        def _key_priority(col):
+            cl = col.lower()
+            if cl == "id" or cl.endswith("_id") or cl.endswith("_key") or cl.endswith("_pk"):
+                return 0
+            if "id" in cl or "key" in cl or "code" in cl or "num" in cl:
+                return 1
+            return 2
+
+        sorted_cols = sorted(common_cols, key=_key_priority)
+
+        for col in sorted_cols:
+            if src_df[col].notna().all() and src_df[col].nunique() == src_count:
+                if tgt_df[col].notna().all() and tgt_df[col].nunique() == tgt_count:
+                    logger.info("Auto-detected key column: %s", col)
+                    return [col]
+
+        for i, c1 in enumerate(sorted_cols[:10]):
+            for c2 in sorted_cols[i + 1 : 10]:
+                if src_df.groupby([c1, c2]).ngroups == src_count:
+                    if tgt_df.groupby([c1, c2]).ngroups == tgt_count:
+                        logger.info("Auto-detected composite key: [%s, %s]", c1, c2)
+                        return [c1, c2]
+
+        logger.info("No key columns auto-detected")
+        return None
+
+    # ── DuckDB no-key fallback with EXCEPT ALL + best-match pairing ──────────
+
+    @staticmethod
+    def _duckdb_no_key_diff(con, src_upper, tgt_upper, common_upper,
+                            max_mismatches):
+        """Accurate no-key diff via EXCEPT ALL with best-match row pairing.
+
+        EXCEPT ALL preserves duplicates (unlike EXCEPT).  After finding the
+        rows that exist on only one side, we greedily pair source-only with
+        target-only rows by maximum column overlap so we can report
+        cell-level diffs instead of just ``(not in target)``.
+        """
+        src_sel = ", ".join(f'"{src_upper[c]}"' for c in common_upper)
+        tgt_sel = ", ".join(f'"{tgt_upper[c]}"' for c in common_upper)
+
+        # EXCEPT ALL: duplicate-aware set difference
+        con.execute(f"""
+            CREATE TABLE _src_only AS
+            SELECT ROW_NUMBER() OVER () AS _rn, * FROM (
+                SELECT {src_sel} FROM src EXCEPT ALL SELECT {tgt_sel} FROM tgt
+            )
+        """)
+        con.execute(f"""
+            CREATE TABLE _tgt_only AS
+            SELECT ROW_NUMBER() OVER () AS _rn, * FROM (
+                SELECT {tgt_sel} FROM tgt EXCEPT ALL SELECT {src_sel} FROM src
+            )
+        """)
+
+        rows_only_src = con.execute("SELECT count(*) FROM _src_only").fetchone()[0]
+        rows_only_tgt = con.execute("SELECT count(*) FROM _tgt_only").fetchone()[0]
+
+        column_details: list[dict] = []
+
+        # Best-match pairing: pair src-only with tgt-only rows that share
+        # the most column values, then diff the remaining columns.
+        if rows_only_src > 0 and rows_only_tgt > 0:
+            max_pair = min(500, rows_only_src, rows_only_tgt)
+
+            match_score = " + ".join(
+                f'CASE WHEN s."{src_upper[c]}" IS NOT DISTINCT FROM '
+                f't."{tgt_upper[c]}" THEN 1 ELSE 0 END'
+                for c in common_upper
+            )
+
+            pair_rows = con.execute(f"""
+                WITH scores AS (
+                    SELECT s._rn AS src_rn, t._rn AS tgt_rn,
+                           ({match_score}) AS score
+                    FROM (SELECT * FROM _src_only WHERE _rn <= {max_pair}) s
+                    CROSS JOIN (SELECT * FROM _tgt_only WHERE _rn <= {max_pair}) t
+                )
+                SELECT src_rn, tgt_rn, score FROM scores
+                WHERE score > 0
+                ORDER BY score DESC
+                LIMIT {max_pair * 10}
+            """).fetchall()
+
+            # Greedy assignment: highest-overlap pair first
+            used_src, used_tgt = set(), set()
+            paired = []
+            for src_rn, tgt_rn, score in pair_rows:
+                if src_rn not in used_src and tgt_rn not in used_tgt:
+                    paired.append((int(src_rn), int(tgt_rn)))
+                    used_src.add(src_rn)
+                    used_tgt.add(tgt_rn)
+
+            # Fetch paired rows and diff column-by-column
+            if paired:
+                pair_values = ", ".join(f"({s}, {t})" for s, t in paired)
+                select_parts = ['p.col0 AS "_ROW"']
+                for c in common_upper:
+                    select_parts.append(f's."{src_upper[c]}" AS "_src_{c}"')
+                    select_parts.append(f't."{tgt_upper[c]}" AS "_tgt_{c}"')
+
+                drill_sql = (
+                    f"SELECT {', '.join(select_parts)} "
+                    f"FROM (VALUES {pair_values}) AS p(col0, col1) "
+                    f"JOIN _src_only s ON s._rn = p.col0 "
+                    f"JOIN _tgt_only t ON t._rn = p.col1"
+                )
+                result_cols = (
+                    ["_ROW"]
+                    + [col for c in common_upper
+                       for col in (f"_src_{c}", f"_tgt_{c}")]
+                )
+                for row_tuple in con.execute(drill_sql).fetchall():
+                    row = dict(zip(result_cols, row_tuple))
+                    for c in common_upper:
+                        sv, tv = row[f"_src_{c}"], row[f"_tgt_{c}"]
+                        if sv is None and tv is None:
+                            continue
+                        if sv is not None and tv is not None:
+                            try:
+                                if float(sv) == float(tv):
+                                    continue
+                            except (ValueError, TypeError):
+                                pass
+                        if str(sv) != str(tv):
+                            column_details.append({
+                                "ROW": row["_ROW"],
+                                "COLUMN": c,
+                                "SOURCE_VALUE": str(sv) if sv is not None else "NULL",
+                                "TARGET_VALUE": str(tv) if tv is not None else "NULL",
+                            })
+                    if len(column_details) >= max_mismatches:
+                        break
+
+            # Paired rows are "changed", not "only on one side"
+            rows_only_src -= len(used_src)
+            rows_only_tgt -= len(used_tgt)
+
+        return column_details, rows_only_src, rows_only_tgt
 
     def run(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
         logger.info("Running data check: %s → %s", config.source_table, config.target_table)
@@ -162,6 +382,12 @@ class DataCheck(BaseCheck):
             if missing:
                 logger.warning("Join keys missing from schema: %s — positional fallback", missing)
                 join_keys_u = []
+
+        # Auto-detect keys if none provided
+        if not join_keys_u:
+            join_keys_u = self._auto_detect_keys_duckdb(
+                con, src_upper, tgt_upper, common_upper
+            )
 
         max_mismatches = config.extra.get("max_mismatches", 10_000)
 
@@ -244,31 +470,10 @@ class DataCheck(BaseCheck):
                     if len(column_details) >= max_mismatches:
                         break
         else:
-            # No join keys — use SQL EXCEPT (set diff, positional)
-            # DuckDB pushes this fully into its vectorized engine
-            src_sel = ", ".join(f'"{src_upper[c]}"' for c in common_upper)
-            tgt_sel = ", ".join(f'"{tgt_upper[c]}"' for c in common_upper)
-            rows_only_src = con.execute(
-                f"SELECT count(*) FROM (SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt)"
-            ).fetchone()[0]
-            rows_only_tgt = con.execute(
-                f"SELECT count(*) FROM (SELECT {tgt_sel} FROM tgt EXCEPT SELECT {src_sel} FROM src)"
-            ).fetchone()[0]
-            # Show differing rows (src side) for drill-down
-            for i, row_tuple in enumerate(
-                con.execute(
-                    f"SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt LIMIT {max_mismatches}"
-                ).fetchall()
-            ):
-                row = dict(zip(common_upper, row_tuple))
-                for c in common_upper:
-                    column_details.append({
-                        "ROW": i + 1, "COLUMN": c,
-                        "SOURCE_VALUE": str(row[c]) if row[c] is not None else "NULL",
-                        "TARGET_VALUE": "(not in target)",
-                    })
-                if len(column_details) >= max_mismatches:
-                    break
+            # No keys even after auto-detect — EXCEPT ALL + best-match pairing
+            column_details, rows_only_src, rows_only_tgt = self._duckdb_no_key_diff(
+                con, src_upper, tgt_upper, common_upper, max_mismatches
+            )
 
         con.close()
 
@@ -395,6 +600,12 @@ class DataCheck(BaseCheck):
                 logger.warning("Join keys missing: %s — positional fallback", missing)
                 join_keys_u = []
 
+        # Auto-detect keys if none provided
+        if not join_keys_u:
+            join_keys_u = self._auto_detect_keys_duckdb(
+                con, src_upper, tgt_upper, common_upper
+            )
+
         max_mismatches = config.extra.get("max_mismatches", 10_000)
         src_count = con.execute("SELECT count(*) FROM src").fetchone()[0]
         tgt_count = con.execute("SELECT count(*) FROM tgt").fetchone()[0]
@@ -467,28 +678,10 @@ class DataCheck(BaseCheck):
                     if len(column_details) >= max_mismatches:
                         break
         else:
-            src_sel = ", ".join(f'"{src_upper[c]}"' for c in common_upper)
-            tgt_sel = ", ".join(f'"{tgt_upper[c]}"' for c in common_upper)
-            rows_only_src = con.execute(
-                f"SELECT count(*) FROM (SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt)"
-            ).fetchone()[0]
-            rows_only_tgt = con.execute(
-                f"SELECT count(*) FROM (SELECT {tgt_sel} FROM tgt EXCEPT SELECT {src_sel} FROM src)"
-            ).fetchone()[0]
-            for i, row_tuple in enumerate(
-                con.execute(
-                    f"SELECT {src_sel} FROM src EXCEPT SELECT {tgt_sel} FROM tgt LIMIT {max_mismatches}"
-                ).fetchall()
-            ):
-                row = dict(zip(common_upper, row_tuple))
-                for c in common_upper:
-                    column_details.append({
-                        "ROW": i + 1, "COLUMN": c,
-                        "SOURCE_VALUE": str(row[c]) if row[c] is not None else "NULL",
-                        "TARGET_VALUE": "(not in target)",
-                    })
-                if len(column_details) >= max_mismatches:
-                    break
+            # No keys even after auto-detect — EXCEPT ALL + best-match pairing
+            column_details, rows_only_src, rows_only_tgt = self._duckdb_no_key_diff(
+                con, src_upper, tgt_upper, common_upper, max_mismatches
+            )
 
         con.close()
 
@@ -780,6 +973,10 @@ class DataCheck(BaseCheck):
         src_count = len(src_df)
         tgt_count = len(tgt_df)
 
+        # Auto-detect keys if none provided
+        if not join_keys:
+            join_keys = self._auto_detect_keys_df(src_df, tgt_df)
+
         # Sort
         if join_keys:
             src_df.sort_values(by=join_keys, inplace=True)
@@ -828,14 +1025,81 @@ class DataCheck(BaseCheck):
         match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
 
         # Column-level drill-down: pair rows by join key and diff each column
+        mismatch_cols = ""
+        col_mismatch_summary = ""
+        details = None
         if join_keys and len(all_src_diffs) > 0 and len(all_tgt_diffs) > 0:
             details, mismatch_cols, col_mismatch_summary = self._column_drill_down(
                 all_src_diffs, all_tgt_diffs, join_keys, config.ignore_columns, max_mismatches
             )
-        else:
-            details = self._build_details(all_src_diffs, all_tgt_diffs, max_mismatches)
-            mismatch_cols = ""
-            col_mismatch_summary = ""
+        elif not join_keys:
+            # No keys — positional column-level drill-down on the sorted data
+            ignore_set = {c.upper() for c in config.ignore_columns}
+            column_details = []
+            min_rows = min(src_count, tgt_count)
+            data_cols = [c for c in src_df.columns if c.upper() not in ignore_set]
+            for idx in range(min_rows):
+                src_row = src_df.iloc[idx]
+                tgt_row = tgt_df.iloc[idx]
+                for col in data_cols:
+                    sv, tv = src_row[col], tgt_row[col]
+                    if pd.isna(sv) and pd.isna(tv):
+                        continue
+                    if not pd.isna(sv) and not pd.isna(tv):
+                        try:
+                            if float(sv) == float(tv):
+                                continue
+                        except (ValueError, TypeError):
+                            pass
+                    if str(sv) != str(tv):
+                        column_details.append({
+                            "ROW": idx + 1,
+                            "column": col,
+                            "source_value": str(sv) if not pd.isna(sv) else "NULL",
+                            "target_value": str(tv) if not pd.isna(tv) else "NULL",
+                        })
+                if len(column_details) >= max_mismatches:
+                    break
+
+            rows_with_diffs = len({d["ROW"] for d in column_details}) if column_details else 0
+            matched_rows = min(src_count, tgt_count) - rows_with_diffs
+            match_pct = round(max(0, matched_rows) / max(src_count, tgt_count) * 100, 2) if max(src_count, tgt_count) else 100.0
+            rows_only_src = max(0, src_count - tgt_count)
+            rows_only_tgt = max(0, tgt_count - src_count)
+            total_mismatches = len(column_details) + rows_only_src + rows_only_tgt
+            is_match = total_mismatches == 0
+            status = Status.PASS if is_match else Status.FAIL
+
+            from collections import Counter
+            col_counts = Counter(d["column"] for d in column_details)
+            mismatch_cols = ", ".join(sorted(col_counts.keys()))
+            col_mismatch_summary = ", ".join(f"{c}:{n}" for c, n in col_counts.most_common(10))
+            details = pd.DataFrame(column_details) if column_details else None
+
+            return CheckResult(
+                check_type=self.name,
+                status=status,
+                metrics={
+                    "src_row_count": src_count,
+                    "tgt_row_count": tgt_count,
+                    "rows_only_in_source": rows_only_src,
+                    "rows_only_in_target": rows_only_tgt,
+                    "rows_with_diffs": rows_with_diffs,
+                    "cell_diffs_found": len(column_details),
+                    "rows_matched": matched_rows,
+                    "match_pct": match_pct,
+                    "mismatch_columns": mismatch_cols,
+                    "column_mismatch_summary": col_mismatch_summary,
+                    "strategy": "full",
+                },
+                details=details,
+                message=(
+                    f"Source={src_count:,}, Target={tgt_count:,}, "
+                    f"match={match_pct}%, "
+                    f"rows_with_diffs={rows_with_diffs}, "
+                    f"Only-in-src={rows_only_src:,}, Only-in-tgt={rows_only_tgt:,}"
+                ),
+            )
 
         return CheckResult(
             check_type=self.name,
