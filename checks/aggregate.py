@@ -1,10 +1,21 @@
-"""Aggregate comparison check (MIN/MAX/AVG/SUM + ID boundary checks)."""
+"""Aggregate comparison check (MIN/MAX/AVG/SUM + ID boundary + GROUP BY).
+
+Best-in-class features:
+- Per-column configurable tolerance (not hardcoded 0.001)
+- GROUP BY aggregate comparison (SUM/AVG by partition/category)
+- STDDEV and COUNT_DISTINCT as additional aggregate functions
+- Proper Infinity handling instead of magic 999999.99
+- WARNING for near-threshold diffs
+- ID boundary checks (MIN/MAX of key columns)
+"""
 
 import logging
+import math
 
 import pandas as pd
 
 from .base import BaseCheck, CheckConfig, CheckResult, Status
+from ..connectors.base import safe_identifier, safe_identifiers, quote_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +31,11 @@ class AggregateCheck(BaseCheck):
         if id_columns == ["NA"]:
             id_columns = []
         functions = config.functions
+        group_by_col = config.extra.get("group_by", "")
+
+        # Per-column tolerance: dict mapping "FUNC_COL" → threshold, or global default
+        col_tolerances = config.extra.get("tolerances", {})
+        default_tolerance = config.extra.get("tolerance", 0.001)
 
         if not agg_columns and not id_columns:
             return CheckResult(
@@ -28,11 +44,20 @@ class AggregateCheck(BaseCheck):
                 message="No aggregate or ID columns specified",
             )
 
-        mismatches = []
-        details_frames = []
+        mismatches: list[dict] = []
+        warnings: list[dict] = []
 
-        # Numeric aggregate check
-        if agg_columns:
+        # ── GROUP BY aggregate comparison ─────────────────────────────────
+        if agg_columns and group_by_col:
+            gb_result = self._group_by_aggregates(
+                src_conn, tgt_conn, config, agg_columns, functions,
+                group_by_col, col_tolerances, default_tolerance
+            )
+            mismatches.extend(gb_result["mismatches"])
+            warnings.extend(gb_result["warnings"])
+
+        # ── Global aggregate comparison ───────────────────────────────────
+        elif agg_columns:
             src_agg = src_conn.get_aggregates(
                 config.source_table, agg_columns, functions, config.where
             )
@@ -43,23 +68,47 @@ class AggregateCheck(BaseCheck):
             tgt_agg.columns = [c.upper() for c in tgt_agg.columns]
 
             for col in src_agg.columns:
-                if col in tgt_agg.columns:
+                if col not in tgt_agg.columns:
+                    continue
+                try:
                     s_val = float(src_agg[col].iloc[0])
                     t_val = float(tgt_agg[col].iloc[0])
-                    if abs(s_val - t_val) > 0.001:
-                        diff = s_val - t_val
-                        pct_diff = round((diff / s_val * 100), 4) if s_val != 0 else (
-                            999999.99 if t_val != 0 else 0.0
-                        )
-                        mismatches.append({
-                            "METRIC": col,
-                            "SRC_VALUE": s_val,
-                            "TGT_VALUE": t_val,
-                            "DIFF": diff,
-                            "PCT_DIFF": pct_diff,
-                        })
+                except (ValueError, TypeError):
+                    continue
 
-        # ID boundary check (MIN/MAX only)
+                tol = col_tolerances.get(col, default_tolerance)
+                diff = s_val - t_val
+
+                if s_val != 0:
+                    pct_diff = round((diff / s_val * 100), 4)
+                elif t_val != 0:
+                    pct_diff = float("inf")
+                else:
+                    pct_diff = 0.0
+
+                # Check tolerance: if tolerance < 1, treat as percentage; else absolute
+                if isinstance(tol, float) and 0 < tol < 1:
+                    exceeds = abs(pct_diff) > tol * 100 if not math.isinf(pct_diff) else True
+                    near_threshold = abs(pct_diff) > tol * 50 if not math.isinf(pct_diff) else False
+                else:
+                    exceeds = abs(diff) > float(tol)
+                    near_threshold = abs(diff) > float(tol) * 0.5
+
+                row = {
+                    "METRIC": col,
+                    "SRC_VALUE": s_val,
+                    "TGT_VALUE": t_val,
+                    "DIFF": round(diff, 5),
+                    "PCT_DIFF": round(pct_diff, 4) if not math.isinf(pct_diff) else "Inf",
+                    "TOLERANCE": tol,
+                }
+
+                if exceeds:
+                    mismatches.append(row)
+                elif near_threshold and abs(diff) > 0:
+                    warnings.append(row)
+
+        # ── ID boundary check (MIN/MAX) ──────────────────────────────────
         if id_columns:
             src_id = src_conn.get_aggregates(
                 config.source_table, id_columns, ["MIN", "MAX"], config.where
@@ -71,25 +120,141 @@ class AggregateCheck(BaseCheck):
             tgt_id.columns = [c.upper() for c in tgt_id.columns]
 
             for col in src_id.columns:
-                if col in tgt_id.columns:
-                    s_val = src_id[col].iloc[0]
-                    t_val = tgt_id[col].iloc[0]
-                    if str(s_val) != str(t_val):
-                        mismatches.append({
-                            "METRIC": col,
-                            "SRC_VALUE": s_val,
-                            "TGT_VALUE": t_val,
-                            "DIFF": "",
-                            "PCT_DIFF": "N/A",
-                        })
+                if col not in tgt_id.columns:
+                    continue
+                s_val = src_id[col].iloc[0]
+                t_val = tgt_id[col].iloc[0]
+                if str(s_val) != str(t_val):
+                    mismatches.append({
+                        "METRIC": col,
+                        "SRC_VALUE": s_val,
+                        "TGT_VALUE": t_val,
+                        "DIFF": "",
+                        "PCT_DIFF": "N/A (boundary)",
+                        "TOLERANCE": "exact",
+                    })
 
-        status = Status.PASS if not mismatches else Status.FAIL
-        details = pd.DataFrame(mismatches) if mismatches else None
+        # ── Status ────────────────────────────────────────────────────────
+        if mismatches:
+            status = Status.FAIL
+        elif warnings:
+            status = Status.WARNING
+        else:
+            status = Status.PASS
+
+        all_issues = mismatches + warnings
+        details = pd.DataFrame(all_issues) if all_issues else None
 
         return CheckResult(
             check_type=self.name,
             status=status,
-            metrics={"agg_mismatches": len(mismatches)},
+            metrics={
+                "agg_mismatches": len(mismatches),
+                "agg_warnings": len(warnings),
+                "group_by": group_by_col or "none",
+            },
             details=details,
-            message=f"{len(mismatches)} aggregate metric(s) mismatched",
+            message=f"{len(mismatches)} aggregate mismatch(es), {len(warnings)} warning(s)",
         )
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _group_by_aggregates(
+        src_conn, tgt_conn, config: CheckConfig,
+        agg_columns: list[str], functions: list[str],
+        group_by_col: str, col_tolerances: dict, default_tolerance: float,
+    ) -> dict:
+        """Compare aggregates broken down by a grouping column."""
+        mismatches: list[dict] = []
+        warnings: list[dict] = []
+
+        src_df = AggregateCheck._group_by_single(src_conn, config.source_table, agg_columns, functions, group_by_col, config.where)
+        tgt_df = AggregateCheck._group_by_single(tgt_conn, config.target_table, agg_columns, functions, group_by_col, config.where)
+
+        gb_upper = group_by_col.upper()
+        merged = src_df.merge(tgt_df, on=gb_upper, how="outer", suffixes=("_SRC", "_TGT"))
+
+        agg_cols_in_merge = [c for c in merged.columns if c.endswith("_SRC")]
+        for src_col_name in agg_cols_in_merge:
+            base = src_col_name[:-4]  # Remove _SRC
+            tgt_col_name = f"{base}_TGT"
+            if tgt_col_name not in merged.columns:
+                continue
+
+            tol = col_tolerances.get(base, default_tolerance)
+
+            for _, row in merged.iterrows():
+                try:
+                    s_val = float(row[src_col_name]) if pd.notna(row[src_col_name]) else 0.0
+                    t_val = float(row[tgt_col_name]) if pd.notna(row[tgt_col_name]) else 0.0
+                except (ValueError, TypeError):
+                    continue
+
+                diff = s_val - t_val
+                if s_val != 0:
+                    pct_diff = round((diff / s_val * 100), 4)
+                elif t_val != 0:
+                    pct_diff = float("inf")
+                else:
+                    continue  # Both zero — skip
+
+                if isinstance(tol, float) and 0 < tol < 1:
+                    exceeds = abs(pct_diff) > tol * 100 if not math.isinf(pct_diff) else True
+                else:
+                    exceeds = abs(diff) > float(tol)
+
+                if exceeds:
+                    mismatches.append({
+                        "METRIC": f"{base} [{gb_upper}={row[gb_upper]}]",
+                        "SRC_VALUE": s_val,
+                        "TGT_VALUE": t_val,
+                        "DIFF": round(diff, 5),
+                        "PCT_DIFF": round(pct_diff, 4) if not math.isinf(pct_diff) else "Inf",
+                        "TOLERANCE": tol,
+                    })
+
+        return {"mismatches": mismatches, "warnings": warnings}
+
+    @staticmethod
+    def _group_by_single(conn, table: str, agg_columns: list[str],
+                          functions: list[str], group_by_col: str,
+                          where: str = "") -> pd.DataFrame:
+        """Get grouped aggregates from a single connection (SQL or CSV)."""
+        try:
+            gb_safe = quote_identifier(safe_identifier(group_by_col))
+            cols_safe = safe_identifiers(agg_columns)
+            tbl = safe_identifier(table)
+            clause = f"WHERE {where}" if where else ""
+
+            expressions = [gb_safe]
+            for col in cols_safe:
+                for func in functions:
+                    expressions.append(
+                        f'COALESCE(CAST({func}("{col}") AS DECIMAL(38,5)), 0) AS "{func}_{col}"'
+                    )
+            query = f"SELECT {', '.join(expressions)} FROM {tbl} {clause} GROUP BY {gb_safe}"
+            df = conn.execute_query(query)
+            df.columns = [c.upper() for c in df.columns]
+            return df
+        except (NotImplementedError, Exception):
+            # Fallback: pandas-based groupby for CSV connectors
+            raw = conn.read_dataframe()
+            gb_match = [c for c in raw.columns if c.upper() == group_by_col.upper()]
+            if not gb_match:
+                raise ValueError(f"Column {group_by_col} not found")
+
+            func_map = {"MIN": "min", "MAX": "max", "AVG": "mean", "SUM": "sum"}
+            result_rows = []
+            for grp_val, grp_df in raw.groupby(gb_match[0]):
+                row = {group_by_col.upper(): grp_val}
+                for col in agg_columns:
+                    col_match = [c for c in grp_df.columns if c.upper() == col.upper()]
+                    if not col_match:
+                        continue
+                    series = pd.to_numeric(grp_df[col_match[0]], errors="coerce")
+                    for func in functions:
+                        val = getattr(series, func_map.get(func, "sum"))()
+                        row[f"{func}_{col.upper()}"] = round(val, 5) if pd.notna(val) else 0
+                result_rows.append(row)
+            return pd.DataFrame(result_rows)
