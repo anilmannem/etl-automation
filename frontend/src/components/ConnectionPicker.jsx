@@ -74,7 +74,7 @@ export default function ConnectionPicker({ label, value, onChange, onConnectionC
               <Box sx={{ flexGrow: 1 }}>
                 <Typography variant="body2" sx={{ fontWeight: 600 }}>{conn.name}</Typography>
                 <Typography variant="caption" sx={{ color: '#64748B' }}>
-                  {conn.id === '__csv__' ? 'Enter file path manually' : conn.platform === 'csv' ? (conn.file_path || 'Shared path') : conn.dsn || conn.host || 'Teradata'}
+                  {conn.id === '__csv__' ? 'Enter file path manually' : conn.platform === 'csv' ? 'Shared path' : conn.dsn || conn.host || 'Teradata'}
                 </Typography>
               </Box>
               <Chip
