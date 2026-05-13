@@ -2,6 +2,7 @@
 
 Best-in-class features:
 - Auto-detect numeric columns when none are specified
+- Cardinality-based classification: measures vs identifiers
 - Per-column configurable tolerance (not hardcoded 0.001)
 - GROUP BY aggregate comparison (SUM/AVG by partition/category)
 - STDDEV and COUNT_DISTINCT as additional aggregate functions
@@ -31,23 +32,77 @@ _NUMERIC_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# Cardinality threshold: if distinct_count / row_count > this, the column
+# is classified as an identifier (e.g. surrogate key) rather than a measure.
+_ID_CARDINALITY_THRESHOLD = 0.9
+
 
 def _is_numeric_type(dtype: str) -> bool:
     """Return True if a DATA_TYPE string represents a numeric column."""
     dtype = dtype.strip().upper()
     # pandas dtypes
-    if dtype in ("INT64", "FLOAT64", "INT32", "FLOAT32", "INT16", "INT8", "UINT8", "UINT16", "UINT32", "UINT64"):
+    if dtype in ("INT64", "FLOAT64", "INT32", "FLOAT32", "INT16", "INT8",
+                 "UINT8", "UINT16", "UINT32", "UINT64"):
         return True
     # SQL / platform types  (NUMBER(18,2), DECIMAL(10,0), INTEGER, etc.)
     return bool(_NUMERIC_PATTERNS.match(dtype))
+
+
+def _get_cardinality(conn, table: str, columns: list[str], where: str = "") -> dict[str, float]:
+    """Return {COLUMN: distinct_ratio} for each column (0.0–1.0).
+
+    Works with both SQL connectors and CSV (pandas fallback).
+    """
+    if not columns:
+        return {}
+
+    # Try SQL first
+    try:
+        tbl = safe_identifier(table)
+        clause = f"WHERE {where}" if where else ""
+        count_exprs = ", ".join(
+            f'COUNT(DISTINCT "{safe_identifier(c)}") AS "NDV_{c}"' for c in columns
+        )
+        query = f'SELECT COUNT(*) AS "TOTAL", {count_exprs} FROM {tbl} {clause}'
+        df = conn.execute_query(query)
+        df.columns = [c.upper() for c in df.columns]
+        total = max(int(df["TOTAL"].iloc[0]), 1)
+        return {c: int(df[f"NDV_{c}"].iloc[0]) / total for c in columns}
+    except (NotImplementedError, Exception):
+        pass
+
+    # Pandas fallback (CSV connector)
+    try:
+        raw = conn.read_dataframe()
+        total = max(len(raw), 1)
+        result = {}
+        for c in columns:
+            match = [col for col in raw.columns if col.upper() == c.upper()]
+            if match:
+                result[c] = raw[match[0]].nunique() / total
+            else:
+                result[c] = 0.0
+        return result
+    except Exception:
+        return {c: 0.0 for c in columns}
 
 
 class AggregateCheck(BaseCheck):
     name = "aggregate"
 
     @staticmethod
-    def _detect_numeric_columns(src_conn, tgt_conn, config: CheckConfig) -> list[str]:
-        """Auto-detect numeric columns common to both source and target."""
+    def _detect_and_classify_columns(
+        src_conn, tgt_conn, config: CheckConfig
+    ) -> tuple[list[str], list[str]]:
+        """Auto-detect numeric columns and classify into measures vs identifiers.
+
+        Uses cardinality analysis: if a numeric column has >90% unique values
+        relative to the row count, it's an identifier (PK/FK/surrogate key).
+        Otherwise it's a measure suitable for SUM/AVG/MIN/MAX.
+
+        Returns:
+            (measure_columns, identifier_columns)
+        """
         src_meta = src_conn.get_metadata(config.source_table)
         tgt_meta = tgt_conn.get_metadata(config.target_table)
 
@@ -64,9 +119,27 @@ class AggregateCheck(BaseCheck):
             if _is_numeric_type(row["DATA_TYPE"]) and row["COLUMN_NAME"].upper() not in ignore_upper
         }
 
-        common = sorted(src_numeric & tgt_numeric)
-        logger.info("Auto-detected %d numeric columns: %s", len(common), common)
-        return common
+        common_numeric = sorted(src_numeric & tgt_numeric)
+        if not common_numeric:
+            return [], []
+
+        # Get cardinality from source to classify columns
+        cardinality = _get_cardinality(src_conn, config.source_table, common_numeric, config.where)
+
+        measures = []
+        identifiers = []
+        for col in common_numeric:
+            ratio = cardinality.get(col, 0.0)
+            if ratio > _ID_CARDINALITY_THRESHOLD:
+                identifiers.append(col)
+                logger.info("Column %s classified as IDENTIFIER (cardinality %.1f%%)", col, ratio * 100)
+            else:
+                measures.append(col)
+                logger.info("Column %s classified as MEASURE (cardinality %.1f%%)", col, ratio * 100)
+
+        logger.info("Auto-detected %d measures %s, %d identifiers %s",
+                     len(measures), measures, len(identifiers), identifiers)
+        return measures, identifiers
 
     def run(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
         logger.info("Running aggregate check: %s → %s", config.source_table, config.target_table)
@@ -82,10 +155,14 @@ class AggregateCheck(BaseCheck):
         col_tolerances = config.extra.get("tolerances", {})
         default_tolerance = config.extra.get("tolerance", 0.001)
 
-        # ── Auto-detect numeric columns if none specified ─────────────────
+        # ── Auto-detect and classify numeric columns ──────────────────────
         auto_detected = False
         if not agg_columns:
-            agg_columns = self._detect_numeric_columns(src_conn, tgt_conn, config)
+            measures, detected_ids = self._detect_and_classify_columns(src_conn, tgt_conn, config)
+            agg_columns = measures
+            # Auto-populate id_columns from high-cardinality numerics (if not manually set)
+            if not id_columns:
+                id_columns = detected_ids
             auto_detected = True
 
         if not agg_columns and not id_columns:
@@ -200,7 +277,8 @@ class AggregateCheck(BaseCheck):
             check_type=self.name,
             status=status,
             metrics={
-                "agg_columns": ", ".join(agg_columns),
+                "measure_columns": ", ".join(agg_columns) if agg_columns else "none",
+                "id_columns": ", ".join(id_columns) if id_columns else "none",
                 "auto_detected": auto_detected,
                 "agg_mismatches": len(mismatches),
                 "agg_warnings": len(warnings),
@@ -208,7 +286,8 @@ class AggregateCheck(BaseCheck):
             },
             details=details,
             message=(
-                f"{'Auto-detected' if auto_detected else 'Checked'} {len(agg_columns)} numeric column(s): "
+                f"{'Auto-detected' if auto_detected else 'Checked'} "
+                f"{len(agg_columns)} measure(s), {len(id_columns)} identifier(s): "
                 f"{len(mismatches)} mismatch(es), {len(warnings)} warning(s)"
             ),
         )
