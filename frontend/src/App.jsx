@@ -5,7 +5,6 @@ import theme from './theme';
 import Sidebar from './components/Sidebar';
 import Dashboard from './pages/Dashboard';
 import SuiteRunner from './pages/SuiteRunner';
-import AdhocTest from './pages/AdhocTest';
 import Connections from './pages/Connections';
 import ResultDetail from './pages/ResultDetail';
 import SuiteResultsView from './pages/SuiteResultsView';
@@ -63,7 +62,6 @@ export default function App() {
               <Route path="/" element={<Dashboard />} />
               <Route path="/connections" element={<Connections />} />
               <Route path="/suite" element={<SuiteRunner onResult={setLastResult} />} />
-              <Route path="/adhoc" element={<AdhocTest onResult={setLastResult} />} />
               <Route path="/results/batch/:batchId" element={<BatchResultPage />} />
               <Route path="/results/:runId" element={<ResultDetail />} />
               <Route

@@ -2,14 +2,12 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { Box, Drawer, Tooltip } from '@mui/material';
 import DashboardRoundedIcon from '@mui/icons-material/DashboardRounded';
 import PlayCircleFilledRoundedIcon from '@mui/icons-material/PlayCircleFilledRounded';
-import BoltRoundedIcon from '@mui/icons-material/BoltRounded';
 import CableRoundedIcon from '@mui/icons-material/CableRounded';
 
 const WIDTH = 64;
 
 const NAV = [
   { label: 'Dashboard', icon: DashboardRoundedIcon, path: '/' },
-  { label: 'Ad-hoc Test', icon: BoltRoundedIcon, path: '/adhoc' },
   { label: 'Test Suite', icon: PlayCircleFilledRoundedIcon, path: '/suite' },
   { label: 'Connections', icon: CableRoundedIcon, path: '/connections' },
 ];

@@ -13,7 +13,6 @@ import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
 import OpenInNewRoundedIcon from '@mui/icons-material/OpenInNewRounded';
 import PlayCircleFilledRoundedIcon from '@mui/icons-material/PlayCircleFilledRounded';
-import BoltRoundedIcon from '@mui/icons-material/BoltRounded';
 import AssessmentRoundedIcon from '@mui/icons-material/AssessmentRounded';
 import TrendingUpRoundedIcon from '@mui/icons-material/TrendingUpRounded';
 import TrendingDownRoundedIcon from '@mui/icons-material/TrendingDownRounded';
@@ -398,18 +397,12 @@ export default function Dashboard() {
         <EmptyState
           icon={AssessmentRoundedIcon}
           title="No validation results yet"
-          subtitle="Run a suite or ad-hoc test to populate your dashboard with metrics, trends, and insights."
+          subtitle="Run a test suite to populate your dashboard with metrics, trends, and insights."
           action={
-            <Box sx={{ display: 'flex', gap: 1.5 }}>
-              <Button variant="contained" startIcon={<PlayCircleFilledRoundedIcon />} onClick={() => navigate('/suite')}
-                sx={{ px: 3, fontWeight: 700, background: 'linear-gradient(135deg,#1D55B0,#3171D6)', boxShadow: '0 4px 14px rgba(49,113,214,0.3)' }}>
-                Run a Suite
-              </Button>
-              <Button variant="outlined" startIcon={<BoltRoundedIcon />} onClick={() => navigate('/adhoc')}
-                sx={{ px: 3, fontWeight: 700, borderColor: 'rgba(15,23,42,0.15)', color: '#475569' }}>
-                Ad-hoc Test
-              </Button>
-            </Box>
+            <Button variant="contained" startIcon={<PlayCircleFilledRoundedIcon />} onClick={() => navigate('/suite')}
+              sx={{ px: 3, fontWeight: 700, background: 'linear-gradient(135deg,#1D55B0,#3171D6)', boxShadow: '0 4px 14px rgba(49,113,214,0.3)' }}>
+              Run a Suite
+            </Button>
           }
         />
       </Box>
@@ -429,11 +422,6 @@ export default function Dashboard() {
           </Typography>
         </Box>
         <Box sx={{ display: 'flex', gap: 1 }}>
-          <Button size="small" variant="outlined" startIcon={<BoltRoundedIcon sx={{ fontSize: 14 }} />}
-            onClick={() => navigate('/adhoc')}
-            sx={{ fontSize: '0.68rem', fontWeight: 600, borderColor: 'rgba(15,23,42,0.1)', color: '#475569', textTransform: 'none' }}>
-            Quick Test
-          </Button>
           <Button size="small" variant="contained" startIcon={<PlayCircleFilledRoundedIcon sx={{ fontSize: 14 }} />}
             onClick={() => navigate('/suite')}
             sx={{ fontSize: '0.68rem', fontWeight: 600, background: 'linear-gradient(135deg,#1D55B0,#3171D6)', textTransform: 'none', boxShadow: '0 2px 8px rgba(49,113,214,0.25)' }}>
