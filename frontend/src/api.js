@@ -20,7 +20,7 @@ export const uploadCsv = (file) => {
     headers: { 'Content-Type': 'multipart/form-data' },
   });
 };
-export const runAdhoc = (data) => api.post('/api/adhoc/run', data);
+export const runChecks = (data) => api.post('/api/run', data);
 export const getHistory = (suite = '', days = 30) =>
   api.get('/api/history', { params: { suite, days } });
 export const getRunResult = (runId) => api.get(`/api/history/${runId}`);

@@ -310,7 +310,7 @@ async def upload_csv(file: UploadFile = File(...)):
     return {"file_path": str(dest), "filename": file.filename, "size": len(content)}
 
 
-# ── Ad-hoc Test ──────────────────────────────────────────────────────────────
+# ── Run Checks ───────────────────────────────────────────────────────────────
 
 def _csv_conn_dict(file_path: str) -> dict:
     """Build a pseudo-connection dict for an uploaded CSV file."""
@@ -321,9 +321,9 @@ def _csv_conn_dict(file_path: str) -> dict:
     }
 
 
-@app.post("/api/adhoc/run")
-def run_adhoc(req: AdhocRequest):
-    """Run ad-hoc checks using saved connections or uploaded CSV files."""
+@app.post("/api/run")
+def run_checks(req: AdhocRequest):
+    """Run checks using saved connections or uploaded CSV files."""
     try:
         # Resolve connections — use uploaded file path or saved connection
         if req.source_file_path:
@@ -350,7 +350,7 @@ def run_adhoc(req: AdhocRequest):
             checks.append(check_dict)
 
         suite_data = {
-            "test_suite": req.suite_name.strip() or "adhoc",
+            "test_suite": req.suite_name.strip() or "quick_test",
             "source": {
                 "platform": src_conn["platform"],
                 "table": req.source_table,
@@ -402,7 +402,7 @@ def run_adhoc(req: AdhocRequest):
         return _suite_result_to_dict(result)
 
     except Exception as e:
-        log.exception("Ad-hoc run failed")
+        log.exception("Check run failed")
         raise HTTPException(status_code=500, detail=str(e))
 
 

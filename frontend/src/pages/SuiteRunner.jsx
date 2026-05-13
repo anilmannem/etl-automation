@@ -25,7 +25,7 @@ import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded';
 import FunctionsRoundedIcon from '@mui/icons-material/FunctionsRounded';
 import CheckRoundedIcon from '@mui/icons-material/CheckRounded';
 import ConnectionPicker from '../components/ConnectionPicker';
-import { runAdhoc } from '../api';
+import { runChecks } from '../api';
 
 const newPair = () => ({ id: Date.now() + Math.random(), srcQuery: '', tgtQuery: '', keyCols: '' });
 
@@ -176,7 +176,7 @@ export default function SuiteRunner({ onResult }) {
           payload.target_table = 'SELECT * FROM data';
           if (tgtConnection?.id && tgtConnection.id !== '__csv__') payload.target_connection_id = tgtConnection.id;
         } else { payload.target_connection_id = tgtConnectionId; payload.target_table = pair.tgtQuery.trim(); }
-        const res = await runAdhoc(payload);
+        const res = await runChecks(payload);
         pairResults.push({
           index: i + 1,
           source_label: pair.srcQuery.trim(),
