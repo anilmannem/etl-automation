@@ -170,7 +170,16 @@ class AggregateCheck(BaseCheck):
         if id_columns == ["NA"]:
             id_columns = []
         functions = config.functions
-        group_by_col = config.extra.get("group_by", "")
+
+        # Resolve group-by columns: join_keys from UI, or extra.group_by from config
+        group_by_cols: list[str] = []
+        join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else []
+        if join_keys:
+            group_by_cols = [k.upper() for k in join_keys]
+        else:
+            gb = config.extra.get("group_by", "")
+            if gb:
+                group_by_cols = [gb.upper()]
 
         # Per-column tolerance: dict mapping "FUNC_COL" → threshold, or global default
         col_tolerances = config.extra.get("tolerances", {})
@@ -186,6 +195,12 @@ class AggregateCheck(BaseCheck):
                 id_columns = detected_ids
             auto_detected = True
 
+        # Exclude group-by columns from aggregation (they're keys, not measures)
+        if group_by_cols:
+            gb_set = set(group_by_cols)
+            agg_columns = [c for c in agg_columns if c.upper() not in gb_set]
+            id_columns = [c for c in id_columns if c.upper() not in gb_set]
+
         if not agg_columns and not id_columns:
             return CheckResult(
                 check_type=self.name,
@@ -196,17 +211,8 @@ class AggregateCheck(BaseCheck):
         mismatches: list[dict] = []
         warnings: list[dict] = []
 
-        # ── GROUP BY aggregate comparison ─────────────────────────────────
-        if agg_columns and group_by_col:
-            gb_result = self._group_by_aggregates(
-                src_conn, tgt_conn, config, agg_columns, functions,
-                group_by_col, col_tolerances, default_tolerance
-            )
-            mismatches.extend(gb_result["mismatches"])
-            warnings.extend(gb_result["warnings"])
-
-        # ── Global aggregate comparison ───────────────────────────────────
-        elif agg_columns:
+        # ── 1. Global aggregate comparison (always) ───────────────────────
+        if agg_columns:
             src_agg = src_conn.get_aggregates(
                 config.source_table, agg_columns, functions, config.where
             )
@@ -257,7 +263,16 @@ class AggregateCheck(BaseCheck):
                 elif near_threshold and abs(diff) > 0:
                     warnings.append(row)
 
-        # ── ID boundary check (MIN/MAX) ──────────────────────────────────
+        # ── 2. GROUP BY aggregate comparison (when join_keys provided) ────
+        if agg_columns and group_by_cols:
+            gb_result = self._group_by_aggregates(
+                src_conn, tgt_conn, config, agg_columns, functions,
+                group_by_cols, col_tolerances, default_tolerance
+            )
+            mismatches.extend(gb_result["mismatches"])
+            warnings.extend(gb_result["warnings"])
+
+        # ── 3. ID boundary check (MIN/MAX) ───────────────────────────────
         if id_columns:
             src_id = src_conn.get_aggregates(
                 config.source_table, id_columns, ["MIN", "MAX"], config.where
@@ -303,7 +318,7 @@ class AggregateCheck(BaseCheck):
                 "auto_detected": auto_detected,
                 "agg_mismatches": len(mismatches),
                 "agg_warnings": len(warnings),
-                "group_by": group_by_col or "none",
+                "group_by": ", ".join(group_by_cols) if group_by_cols else "none",
             },
             details=details,
             message=(
@@ -319,16 +334,16 @@ class AggregateCheck(BaseCheck):
     def _group_by_aggregates(
         src_conn, tgt_conn, config: CheckConfig,
         agg_columns: list[str], functions: list[str],
-        group_by_col: str, col_tolerances: dict, default_tolerance: float,
+        group_by_cols: list[str], col_tolerances: dict, default_tolerance: float,
     ) -> dict:
-        """Compare aggregates broken down by a grouping column."""
+        """Compare aggregates broken down by one or more grouping columns."""
         mismatches: list[dict] = []
         warnings: list[dict] = []
 
-        src_df = AggregateCheck._group_by_single(src_conn, config.source_table, agg_columns, functions, group_by_col, config.where)
-        tgt_df = AggregateCheck._group_by_single(tgt_conn, config.target_table, agg_columns, functions, group_by_col, config.where)
+        src_df = AggregateCheck._group_by_single(src_conn, config.source_table, agg_columns, functions, group_by_cols, config.where)
+        tgt_df = AggregateCheck._group_by_single(tgt_conn, config.target_table, agg_columns, functions, group_by_cols, config.where)
 
-        gb_upper = group_by_col.upper()
+        gb_upper = [c.upper() for c in group_by_cols]
         merged = src_df.merge(tgt_df, on=gb_upper, how="outer", suffixes=("_SRC", "_TGT"))
 
         agg_cols_in_merge = [c for c in merged.columns if c.endswith("_SRC")]
@@ -361,8 +376,11 @@ class AggregateCheck(BaseCheck):
                     exceeds = abs(diff) > float(tol)
 
                 if exceeds:
+                    # Build key label: [REGION=East, CATEGORY=Electronics]
+                    key_parts = [f"{k}={row[k]}" for k in gb_upper]
+                    key_label = ", ".join(key_parts)
                     mismatches.append({
-                        "METRIC": f"{base} [{gb_upper}={row[gb_upper]}]",
+                        "METRIC": f"{base} [{key_label}]",
                         "SRC_VALUE": s_val,
                         "TGT_VALUE": t_val,
                         "DIFF": round(diff, 5),
@@ -374,36 +392,43 @@ class AggregateCheck(BaseCheck):
 
     @staticmethod
     def _group_by_single(conn, table: str, agg_columns: list[str],
-                          functions: list[str], group_by_col: str,
+                          functions: list[str], group_by_cols: list[str],
                           where: str = "") -> pd.DataFrame:
         """Get grouped aggregates from a single connection (SQL or CSV)."""
         try:
-            gb_safe = quote_identifier(safe_identifier(group_by_col))
+            gb_safe = [quote_identifier(safe_identifier(c)) for c in group_by_cols]
+            gb_list = ", ".join(gb_safe)
             cols_safe = safe_identifiers(agg_columns)
             tbl = safe_identifier(table)
             clause = f"WHERE {where}" if where else ""
 
-            expressions = [gb_safe]
+            expressions = list(gb_safe)
             for col in cols_safe:
                 for func in functions:
                     expressions.append(
                         f'COALESCE(CAST({func}("{col}") AS DECIMAL(38,5)), 0) AS "{func}_{col}"'
                     )
-            query = f"SELECT {', '.join(expressions)} FROM {tbl} {clause} GROUP BY {gb_safe}"
+            query = f"SELECT {', '.join(expressions)} FROM {tbl} {clause} GROUP BY {gb_list}"
             df = conn.execute_query(query)
             df.columns = [c.upper() for c in df.columns]
             return df
         except (NotImplementedError, Exception):
             # Fallback: pandas-based groupby for CSV connectors
             raw = conn.read_dataframe()
-            gb_match = [c for c in raw.columns if c.upper() == group_by_col.upper()]
-            if not gb_match:
-                raise ValueError(f"Column {group_by_col} not found")
+            gb_matches = []
+            for gb_col in group_by_cols:
+                match = [c for c in raw.columns if c.upper() == gb_col.upper()]
+                if not match:
+                    raise ValueError(f"Column {gb_col} not found")
+                gb_matches.append(match[0])
 
             func_map = {"MIN": "min", "MAX": "max", "AVG": "mean", "SUM": "sum"}
             result_rows = []
-            for grp_val, grp_df in raw.groupby(gb_match[0]):
-                row = {group_by_col.upper(): grp_val}
+            for grp_vals, grp_df in raw.groupby(gb_matches):
+                # grp_vals is a tuple when multiple columns, scalar when single
+                if not isinstance(grp_vals, tuple):
+                    grp_vals = (grp_vals,)
+                row = {gb_col.upper(): val for gb_col, val in zip(group_by_cols, grp_vals)}
                 for col in agg_columns:
                     col_match = [c for c in grp_df.columns if c.upper() == col.upper()]
                     if not col_match:

@@ -343,8 +343,10 @@ def run_checks(req: AdhocRequest):
                 check_dict["column_drill_down"] = c.column_drill_down
                 if c.strategy == "sample":
                     check_dict["sample_pct"] = c.sample_pct
-                if c.join_keys:
-                    check_dict["join_keys"] = c.join_keys
+            if c.join_keys:
+                check_dict["join_keys"] = c.join_keys
+            if c.columns:
+                check_dict["columns"] = c.columns
             if c.type == "aggregate" and c.functions:
                 check_dict["functions"] = c.functions
             checks.append(check_dict)
