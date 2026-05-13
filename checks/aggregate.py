@@ -1,6 +1,7 @@
 """Aggregate comparison check (MIN/MAX/AVG/SUM + ID boundary + GROUP BY).
 
 Best-in-class features:
+- Auto-detect numeric columns when none are specified
 - Per-column configurable tolerance (not hardcoded 0.001)
 - GROUP BY aggregate comparison (SUM/AVG by partition/category)
 - STDDEV and COUNT_DISTINCT as additional aggregate functions
@@ -11,6 +12,7 @@ Best-in-class features:
 
 import logging
 import math
+import re
 
 import pandas as pd
 
@@ -19,9 +21,52 @@ from ..connectors.base import safe_identifier, safe_identifiers, quote_identifie
 
 logger = logging.getLogger(__name__)
 
+# Types that are considered numeric across all platforms
+_NUMERIC_PATTERNS = re.compile(
+    r"^(INT|INTEGER|BIGINT|SMALLINT|TINYINT|BYTEINT"
+    r"|FLOAT|DOUBLE|REAL"
+    r"|DECIMAL|NUMERIC|DEC|NUMBER"
+    r"|INT8|INT16|INT32|INT64|FLOAT32|FLOAT64"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_numeric_type(dtype: str) -> bool:
+    """Return True if a DATA_TYPE string represents a numeric column."""
+    dtype = dtype.strip().upper()
+    # pandas dtypes
+    if dtype in ("INT64", "FLOAT64", "INT32", "FLOAT32", "INT16", "INT8", "UINT8", "UINT16", "UINT32", "UINT64"):
+        return True
+    # SQL / platform types  (NUMBER(18,2), DECIMAL(10,0), INTEGER, etc.)
+    return bool(_NUMERIC_PATTERNS.match(dtype))
+
 
 class AggregateCheck(BaseCheck):
     name = "aggregate"
+
+    @staticmethod
+    def _detect_numeric_columns(src_conn, tgt_conn, config: CheckConfig) -> list[str]:
+        """Auto-detect numeric columns common to both source and target."""
+        src_meta = src_conn.get_metadata(config.source_table)
+        tgt_meta = tgt_conn.get_metadata(config.target_table)
+
+        ignore_upper = {c.upper() for c in config.ignore_columns}
+
+        src_numeric = {
+            row["COLUMN_NAME"].upper()
+            for _, row in src_meta.iterrows()
+            if _is_numeric_type(row["DATA_TYPE"]) and row["COLUMN_NAME"].upper() not in ignore_upper
+        }
+        tgt_numeric = {
+            row["COLUMN_NAME"].upper()
+            for _, row in tgt_meta.iterrows()
+            if _is_numeric_type(row["DATA_TYPE"]) and row["COLUMN_NAME"].upper() not in ignore_upper
+        }
+
+        common = sorted(src_numeric & tgt_numeric)
+        logger.info("Auto-detected %d numeric columns: %s", len(common), common)
+        return common
 
     def run(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
         logger.info("Running aggregate check: %s → %s", config.source_table, config.target_table)
@@ -37,11 +82,17 @@ class AggregateCheck(BaseCheck):
         col_tolerances = config.extra.get("tolerances", {})
         default_tolerance = config.extra.get("tolerance", 0.001)
 
+        # ── Auto-detect numeric columns if none specified ─────────────────
+        auto_detected = False
+        if not agg_columns:
+            agg_columns = self._detect_numeric_columns(src_conn, tgt_conn, config)
+            auto_detected = True
+
         if not agg_columns and not id_columns:
             return CheckResult(
                 check_type=self.name,
-                status=Status.NOT_APPLICABLE,
-                message="No aggregate or ID columns specified",
+                status=Status.PASS,
+                message="No numeric columns found to aggregate",
             )
 
         mismatches: list[dict] = []
@@ -149,12 +200,17 @@ class AggregateCheck(BaseCheck):
             check_type=self.name,
             status=status,
             metrics={
+                "agg_columns": ", ".join(agg_columns),
+                "auto_detected": auto_detected,
                 "agg_mismatches": len(mismatches),
                 "agg_warnings": len(warnings),
                 "group_by": group_by_col or "none",
             },
             details=details,
-            message=f"{len(mismatches)} aggregate mismatch(es), {len(warnings)} warning(s)",
+            message=(
+                f"{'Auto-detected' if auto_detected else 'Checked'} {len(agg_columns)} numeric column(s): "
+                f"{len(mismatches)} mismatch(es), {len(warnings)} warning(s)"
+            ),
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
