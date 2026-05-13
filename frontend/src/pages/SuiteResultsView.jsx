@@ -23,7 +23,7 @@ const STATUS = {
 };
 
 const fmtType = (t) => ({
-  row_count: 'Row Count', metadata: 'Schema', null_check: 'Nulls',
+  row_count: 'Row Count', metadata: 'Metadata', null_check: 'Nulls',
   data: 'Data Diff', duplicate: 'Duplicates', aggregate: 'Aggregates',
 }[t] || t);
 

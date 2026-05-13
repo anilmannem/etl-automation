@@ -42,7 +42,7 @@ const METRIC_LABELS = {
   duplicate_rows_src: 'Duplicates (source)', duplicate_rows_tgt: 'Duplicates (target)',
 };
 const fmtMetric = (k) => METRIC_LABELS[k] || k.replace(/_/g, ' ');
-const fmtType = (t) => ({ row_count: 'Row Count', metadata: 'Schema / Metadata', null_check: 'Null Analysis', data: 'Data Comparison', duplicate: 'Duplicate Check' }[t] || t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()));
+const fmtType = (t) => ({ row_count: 'Row Count', metadata: 'Metadata', null_check: 'Null Analysis', data: 'Data Comparison', duplicate: 'Duplicate Check', aggregate: 'Aggregates' }[t] || t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()));
 const fmtVal = (v) => v === null || v === undefined ? '—' : typeof v === 'number' ? v.toLocaleString() : String(v);
 
 const COL_HEADERS = {
@@ -111,7 +111,7 @@ function getRecommendation(check) {
       if (m.row_count_diff < 0) return 'Target has more rows — check for duplicate inserts or missing deduplication logic.';
       return 'Row counts diverged — verify the ETL load completed successfully.';
     case 'metadata':
-      return 'Schema mismatch detected — review column type changes. This may indicate an upstream schema migration.';
+      return 'Metadata mismatch detected — review column type changes. This may indicate an upstream schema migration.';
     case 'null_check':
       return 'Null count mismatch — check for coalesce/default-value logic differences or missing NOT NULL constraints.';
     case 'duplicate':

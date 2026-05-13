@@ -31,7 +31,7 @@ const newPair = () => ({ id: Date.now() + Math.random(), srcQuery: '', tgtQuery:
 
 const CHECK_META = [
   { type: 'row_count', label: 'Row Count', icon: TableRowsRoundedIcon, color: '#3171D6' },
-  { type: 'metadata', label: 'Schema', icon: SchemaRoundedIcon, color: '#0891B2' },
+  { type: 'metadata', label: 'Metadata', icon: SchemaRoundedIcon, color: '#0891B2' },
   { type: 'null_check', label: 'Nulls', icon: RemoveCircleOutlineRoundedIcon, color: '#D97706' },
   { type: 'duplicate', label: 'Duplicates', icon: ContentCopyRoundedIcon, color: '#DB2777' },
   { type: 'data', label: 'Data Diff', icon: CompareArrowsRoundedIcon, color: '#7C3AED' },
