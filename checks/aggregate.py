@@ -48,32 +48,53 @@ def _is_numeric_type(dtype: str) -> bool:
     return bool(_NUMERIC_PATTERNS.match(dtype))
 
 
+# Max rows to sample for cardinality estimation (keeps classification fast
+# regardless of table size — O(constant) instead of O(N)).
+_CARDINALITY_SAMPLE_SIZE = 10_000
+
+
 def _get_cardinality(conn, table: str, columns: list[str], where: str = "") -> dict[str, float]:
     """Return {COLUMN: distinct_ratio} for each column (0.0–1.0).
 
+    Samples up to _CARDINALITY_SAMPLE_SIZE rows for efficiency.
     Works with both SQL connectors and CSV (pandas fallback).
     """
     if not columns:
         return {}
 
-    # Try SQL first
+    # Try SQL first — use a sampled subquery for performance on large tables
     try:
         tbl = safe_identifier(table)
         clause = f"WHERE {where}" if where else ""
         count_exprs = ", ".join(
             f'COUNT(DISTINCT "{safe_identifier(c)}") AS "NDV_{c}"' for c in columns
         )
-        query = f'SELECT COUNT(*) AS "TOTAL", {count_exprs} FROM {tbl} {clause}'
-        df = conn.execute_query(query)
+        # Try Teradata SAMPLE syntax first, fall back to ANSI LIMIT
+        try:
+            sample_query = (
+                f'SELECT COUNT(*) AS "TOTAL", {count_exprs} '
+                f'FROM (SELECT * FROM {tbl} {clause} SAMPLE {_CARDINALITY_SAMPLE_SIZE}) AS _sample'
+            )
+            df = conn.execute_query(sample_query)
+        except Exception:
+            # Fallback: standard SQL with LIMIT (Postgres, DuckDB, etc.)
+            sample_query = (
+                f'SELECT COUNT(*) AS "TOTAL", {count_exprs} '
+                f'FROM (SELECT * FROM {tbl} {clause} LIMIT {_CARDINALITY_SAMPLE_SIZE}) AS _sample'
+            )
+            df = conn.execute_query(sample_query)
+
         df.columns = [c.upper() for c in df.columns]
         total = max(int(df["TOTAL"].iloc[0]), 1)
         return {c: int(df[f"NDV_{c}"].iloc[0]) / total for c in columns}
     except (NotImplementedError, Exception):
         pass
 
-    # Pandas fallback (CSV connector)
+    # Pandas fallback (CSV connector) — sample first N rows
     try:
         raw = conn.read_dataframe()
+        if len(raw) > _CARDINALITY_SAMPLE_SIZE:
+            raw = raw.sample(n=_CARDINALITY_SAMPLE_SIZE, random_state=42)
         total = max(len(raw), 1)
         result = {}
         for c in columns:
