@@ -132,8 +132,9 @@ if ($frontendPids) {
 # ============================================================
 Write-Host "`n[7/7] Starting services..." -ForegroundColor Yellow
 
-# Backend window
-$backendCmd = "Set-Location '$ProjectRoot'; . '$activateScript'; python -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload"
+# Backend window — must run from PARENT directory so Python finds etl_validator package
+$parentDir = Split-Path $ProjectRoot -Parent
+$backendCmd = "Set-Location '$parentDir'; . '$activateScript'; python -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir '$ProjectRoot'"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $backendCmd
 Write-Host "  Backend starting at http://localhost:8000" -ForegroundColor Green
 
