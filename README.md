@@ -23,7 +23,43 @@ A data quality platform for validating ETL pipelines. Compare source and target 
 
 ## Quick Start
 
-### Backend
+### Automated Setup (Windows)
+
+The easiest way to get started — works on any Windows machine with Python 3.10+ and Node.js installed:
+
+```powershell
+# Clone the repository (must use folder name "etl_validator")
+git clone <repo-url> etl_validator
+cd etl_validator
+
+# Run the auto-setup script (handles everything)
+powershell -ExecutionPolicy Bypass -File .\restart.ps1
+```
+
+The script will:
+- ✅ Auto-detect Python and Node.js installations
+- ✅ Create Python virtual environment
+- ✅ Install all Python dependencies
+- ✅ Install all npm packages
+- ✅ Start backend (FastAPI) on port 8000
+- ✅ Start frontend (React/Vite) on port 5173
+- ✅ Open both in new PowerShell windows
+
+**Access the application:**
+- Frontend UI: http://localhost:5173
+- Backend API: http://localhost:8000
+- API Docs: http://localhost:8000/docs
+
+**Subsequent runs** (skip dependency install):
+```powershell
+powershell -ExecutionPolicy Bypass -File .\restart.ps1 -SkipSetup
+```
+
+---
+
+### Manual Setup
+
+#### Backend
 
 ```bash
 pip install -r requirements.txt
@@ -32,7 +68,7 @@ pip install -r requirements.txt
 python -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Frontend
+#### Frontend
 
 ```bash
 cd frontend
@@ -42,7 +78,7 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) in your browser.
 
-### CLI
+#### CLI
 
 ```bash
 pip install -e .
