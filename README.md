@@ -121,31 +121,3 @@ etl_validator/
 | Duplicate | Detect duplicate records unique to each side |
 | Data Diff | Row-level comparison — hash, full diff, or sample strategies |
 | Aggregate | MIN/MAX/AVG/SUM per column comparison |
-
-##Kill & restart backend:
-```# Kill anything on port 8000
-netstat -ano | findstr :8000
-taskkill /PID <PID_FROM_ABOVE> /F
-
-# Or one-liner to kill all on port 8000:
-for /f "tokens=5" %a in ('netstat -ano ^| findstr :8000') do taskkill /PID %a /F
-
-# Start backend
-cd C:\path\to\etl_validator
-pip install -e .
-python -m uvicorn etl_validator.api:app --reload --port 8000 --host 0.0.0.0
-```
-
-##Kill & restart frontend:
-```# Kill anything on port 5176
-for /f "tokens=5" %a in ('netstat -ano ^| findstr :5176') do taskkill /PID %a /F
-
-# Start frontend
-cd C:\path\to\etl_validator\frontend
-npm install
-npm run dev -- --port 5176 --host 0.0.0.0
-```
-
-
-
-
