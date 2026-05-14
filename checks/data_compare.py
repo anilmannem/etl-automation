@@ -26,6 +26,21 @@ from ..connectors.base import safe_identifier, safe_identifiers, deterministic_s
 logger = logging.getLogger(__name__)
 
 
+def _compute_match_pct(src_count: int, tgt_count: int,
+                       rows_only_src: int, rows_only_tgt: int,
+                       rows_with_diffs: int) -> float:
+    """Compute match percentage accounting for all unmatched rows.
+
+    Formula: matched = min(src, tgt) - rows_only_src - rows_only_tgt - rows_with_diffs
+    (clamped to 0). Denominator is max(src, tgt) to penalise row-count gaps.
+    """
+    total = max(src_count, tgt_count)
+    if total == 0:
+        return 100.0
+    matched = max(0, min(src_count, tgt_count) - rows_only_src - rows_only_tgt - rows_with_diffs)
+    return round(matched / total * 100, 2)
+
+
 def _build_row_hash_query(
     table: str, columns: list[str], where: str = "",
     key_columns: list[str] | None = None,
@@ -492,11 +507,8 @@ class DataCheck(BaseCheck):
 
         unique_key = join_keys_u[0] if join_keys_u else "ROW"
         rows_with_diffs = len({d.get(unique_key) for d in column_details}) if column_details else 0
-        matched_rows = min(src_count, tgt_count) - rows_with_diffs
-        match_pct = (
-            round(max(0, matched_rows) / max(src_count, tgt_count) * 100, 2)
-            if max(src_count, tgt_count) else 100.0
-        )
+        comparison_mode = "keyed" if join_keys_u else "positional"
+        match_pct = _compute_match_pct(src_count, tgt_count, rows_only_src, rows_only_tgt, rows_with_diffs)
         total_mismatches = len(column_details) + rows_only_src + rows_only_tgt
         status = Status.PASS if total_mismatches == 0 else Status.FAIL
         details = pd.DataFrame(column_details) if column_details else None
@@ -514,6 +526,8 @@ class DataCheck(BaseCheck):
                 "mismatch_columns": mismatch_cols,
                 "column_mismatch_summary": col_summary,
                 "match_pct": match_pct,
+                "comparison_mode": comparison_mode,
+                "join_keys_used": ", ".join(join_keys_u) if join_keys_u else "none",
                 "strategy": "duckdb",
             },
             details=details,
@@ -521,6 +535,7 @@ class DataCheck(BaseCheck):
                 f"DuckDB diff: src={src_count:,}, tgt={tgt_count:,}, "
                 f"only_src={rows_only_src:,}, only_tgt={rows_only_tgt:,}, "
                 f"cell_diffs={len(column_details):,}, match={match_pct}%"
+                + (f", keys=[{', '.join(join_keys_u)}]" if join_keys_u else ", keys=none (positional)")
                 + (f", diff_cols=[{mismatch_cols}]" if mismatch_cols else "")
             ),
         )
@@ -699,11 +714,8 @@ class DataCheck(BaseCheck):
         col_summary = ", ".join(f"{c}:{n}" for c, n in col_counts.most_common(10))
         unique_key = join_keys_u[0] if join_keys_u else "ROW"
         rows_with_diffs = len({d.get(unique_key) for d in column_details}) if column_details else 0
-        matched_rows = min(src_count, tgt_count) - rows_with_diffs
-        match_pct = (
-            round(max(0, matched_rows) / max(src_count, tgt_count) * 100, 2)
-            if max(src_count, tgt_count) else 100.0
-        )
+        comparison_mode = "keyed" if join_keys_u else "positional"
+        match_pct = _compute_match_pct(src_count, tgt_count, rows_only_src, rows_only_tgt, rows_with_diffs)
         total_mismatches = len(column_details) + rows_only_src + rows_only_tgt
         status = Status.PASS if total_mismatches == 0 else Status.FAIL
         details = pd.DataFrame(column_details) if column_details else None
@@ -721,6 +733,8 @@ class DataCheck(BaseCheck):
                 "mismatch_columns": mismatch_cols,
                 "column_mismatch_summary": col_summary,
                 "match_pct": match_pct,
+                "comparison_mode": comparison_mode,
+                "join_keys_used": ", ".join(join_keys_u) if join_keys_u else "none",
                 "strategy": "duckdb_bridge",
             },
             details=details,
@@ -728,6 +742,7 @@ class DataCheck(BaseCheck):
                 f"DuckDB bridge diff: src={src_count:,}, tgt={tgt_count:,}, "
                 f"only_src={rows_only_src:,}, only_tgt={rows_only_tgt:,}, "
                 f"cell_diffs={len(column_details):,}, match={match_pct}%"
+                + (f", keys=[{', '.join(join_keys_u)}]" if join_keys_u else ", keys=none (positional)")
                 + (f", diff_cols=[{mismatch_cols}]" if mismatch_cols else "")
             ),
         )
@@ -873,7 +888,7 @@ class DataCheck(BaseCheck):
         # Match percentage
         matched_rows = len(both) - n_hash_diff
         total_compared = max(src_count, tgt_count)
-        match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
+        match_pct = _compute_match_pct(src_count, tgt_count, n_only_src, n_only_tgt, n_hash_diff)
 
         status = Status.PASS if total_mismatches == 0 else Status.FAIL
 
@@ -886,11 +901,15 @@ class DataCheck(BaseCheck):
                 "rows_only_in_source": n_only_src,
                 "rows_only_in_target": n_only_tgt,
                 "rows_hash_mismatch": n_hash_diff,
+                "rows_with_diffs": n_hash_diff,
                 "rows_matched": matched_rows,
                 "match_pct": match_pct,
+                "cell_diffs_found": len(column_details),
                 "column_diffs_found": len(column_details),
                 "mismatch_columns": mismatch_cols,
                 "column_mismatch_summary": col_mismatch_summary,
+                "comparison_mode": "keyed",
+                "join_keys_used": ", ".join(k.upper() for k in join_keys),
                 "strategy": "hash",
             },
             details=details,
@@ -1030,13 +1049,15 @@ class DataCheck(BaseCheck):
 
         total_mismatches = len(all_src_diffs) + len(all_tgt_diffs)
         total_compared = max(src_count, tgt_count)
-        matched_rows = total_compared - max(len(all_src_diffs), len(all_tgt_diffs))
-        match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
+        rows_with_diffs = max(len(all_src_diffs), len(all_tgt_diffs))
+        matched_rows = total_compared - rows_with_diffs
+        match_pct = _compute_match_pct(src_count, tgt_count, len(all_src_diffs), len(all_tgt_diffs), 0)
 
         # Column-level drill-down: pair rows by join key and diff each column
         mismatch_cols = ""
         col_mismatch_summary = ""
         details = None
+        keyed = bool(join_keys)
         if join_keys and len(all_src_diffs) > 0 and len(all_tgt_diffs) > 0:
             details, mismatch_cols, col_mismatch_summary = self._column_drill_down(
                 all_src_diffs, all_tgt_diffs, join_keys, config.ignore_columns, max_mismatches
@@ -1071,10 +1092,9 @@ class DataCheck(BaseCheck):
                     break
 
             rows_with_diffs = len({d["ROW"] for d in column_details}) if column_details else 0
-            matched_rows = min(src_count, tgt_count) - rows_with_diffs
-            match_pct = round(max(0, matched_rows) / max(src_count, tgt_count) * 100, 2) if max(src_count, tgt_count) else 100.0
             rows_only_src = max(0, src_count - tgt_count)
             rows_only_tgt = max(0, tgt_count - src_count)
+            match_pct = _compute_match_pct(src_count, tgt_count, rows_only_src, rows_only_tgt, rows_with_diffs)
             total_mismatches = len(column_details) + rows_only_src + rows_only_tgt
             is_match = total_mismatches == 0
             status = Status.PASS if is_match else Status.FAIL
@@ -1099,12 +1119,14 @@ class DataCheck(BaseCheck):
                     "match_pct": match_pct,
                     "mismatch_columns": mismatch_cols,
                     "column_mismatch_summary": col_mismatch_summary,
+                    "comparison_mode": "positional",
+                    "join_keys_used": "none",
                     "strategy": "full",
                 },
                 details=details,
                 message=(
                     f"Source={src_count:,}, Target={tgt_count:,}, "
-                    f"match={match_pct}%, "
+                    f"match={match_pct}%, keys=none (positional), "
                     f"rows_with_diffs={rows_with_diffs}, "
                     f"Only-in-src={rows_only_src:,}, Only-in-tgt={rows_only_tgt:,}"
                 ),
@@ -1122,6 +1144,8 @@ class DataCheck(BaseCheck):
                 "match_pct": match_pct,
                 "mismatch_columns": mismatch_cols,
                 "column_mismatch_summary": col_mismatch_summary,
+                "comparison_mode": "keyed" if keyed else "positional",
+                "join_keys_used": ", ".join(k.upper() for k in join_keys) if join_keys else "none",
                 "strategy": "full",
             },
             details=details,
@@ -1198,7 +1222,7 @@ class DataCheck(BaseCheck):
 
         total_compared = max(src_count, tgt_count)
         matched_rows = total_compared - max(len(all_src_diffs), len(all_tgt_diffs))
-        match_pct = round((matched_rows / total_compared * 100), 2) if total_compared else 100.0
+        match_pct = _compute_match_pct(src_count, tgt_count, len(all_src_diffs), len(all_tgt_diffs), 0)
 
         # Column-level drill-down when join keys are available
         key_list = join_keys if join_keys else []
@@ -1223,6 +1247,8 @@ class DataCheck(BaseCheck):
                 "match_pct": match_pct,
                 "mismatch_columns": mismatch_cols,
                 "column_mismatch_summary": col_mismatch_summary,
+                "comparison_mode": "keyed" if join_keys else "positional",
+                "join_keys_used": ", ".join(k.upper() for k in join_keys) if join_keys else "none",
                 "strategy": "streaming",
             },
             details=details,

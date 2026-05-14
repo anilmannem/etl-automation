@@ -84,6 +84,7 @@ const METRIC_LABELS = {
   src_column_count: 'Source columns', tgt_column_count: 'Target columns',
   match_pct: 'Match %', rows_only_in_source: 'Only in source', rows_only_in_target: 'Only in target',
   rows_with_diffs: 'Rows with diffs', cell_diffs_found: 'Cell diffs',
+  comparison_mode: 'Comparison mode', join_keys_used: 'Join keys',
   duplicate_rows_src: 'Duplicates (src)', duplicate_rows_tgt: 'Duplicates (tgt)',
 };
 const fmtMetric = (k) => METRIC_LABELS[k] || k.replace(/_/g, ' ');

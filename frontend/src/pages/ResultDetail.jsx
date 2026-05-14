@@ -35,9 +35,10 @@ const METRIC_LABELS = {
   mismatched_columns: 'Type/nullable mismatches',
   src_column_count: 'Source columns', tgt_column_count: 'Target columns',
   columns_only_in_source: 'Only in source', columns_only_in_target: 'Only in target',
-  rows_only_in_source: 'Rows only in source', rows_only_in_target: 'Rows only in target',
+  rows_only_in_source: 'Only in source', rows_only_in_target: 'Only in target',
   rows_with_diffs: 'Rows with differences', cell_diffs_found: 'Cell-level diffs',
   match_pct: 'Match %', diff_columns: 'Columns affected',
+  comparison_mode: 'Comparison mode', join_keys_used: 'Join keys used',
   value_mismatches: 'Value mismatches', mismatch_count: 'Mismatches',
   duplicate_rows_src: 'Duplicates (source)', duplicate_rows_tgt: 'Duplicates (target)',
 };
@@ -360,9 +361,39 @@ function DataSummary({ metrics }) {
   const colSummary = metrics.column_mismatch_summary ?? '';
   const colList = typeof mismatchCols === 'string' ? mismatchCols.split(',').map(s => s.trim()).filter(Boolean) : [];
   const matchColor = matchPct >= 90 ? '#059669' : matchPct >= 70 ? '#D97706' : '#DC2626';
+  const isPositional = (metrics.comparison_mode ?? '') === 'positional';
+  const joinKeys = metrics.join_keys_used ?? '';
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      {/* Positional mode warning banner */}
+      {isPositional && (
+        <Box sx={{
+          display: 'flex', alignItems: 'center', gap: 1, px: 1.5, py: 0.75,
+          bgcolor: '#FFFBEB', border: '1px solid #FCD34D', borderRadius: '8px',
+        }}>
+          <WarningAmberRoundedIcon sx={{ fontSize: 14, color: '#D97706' }} />
+          <Typography sx={{ fontSize: '0.65rem', color: '#92400E', lineHeight: 1.4 }}>
+            <strong>No join key found</strong> — comparing by row position. "Unmatched" counts may be inflated because
+            a single changed cell makes the entire row appear as unmatched on both sides. Specify join keys for accurate results.
+          </Typography>
+        </Box>
+      )}
+      {/* Join keys info */}
+      {!isPositional && joinKeys && joinKeys !== 'none' && (
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+          <Typography sx={{ fontSize: '0.56rem', fontWeight: 700, color: '#94A3B8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+            Join keys
+          </Typography>
+          {joinKeys.split(',').map(k => k.trim()).filter(Boolean).map(k => (
+            <Chip key={k} label={k} size="small" sx={{
+              height: 18, fontSize: '0.58rem', fontWeight: 600,
+              bgcolor: '#EFF6FF', color: '#1D4ED8', border: '1px solid rgba(59,130,246,0.15)',
+              fontFamily: '"JetBrains Mono", monospace',
+            }} />
+          ))}
+        </Box>
+      )}
       {/* Match % hero + row counts */}
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5, py: 0.5 }}>
         <Box sx={{ display: 'flex', alignItems: 'baseline', gap: 0.5, mr: 0.5 }}>
@@ -376,9 +407,9 @@ function DataSummary({ metrics }) {
         <StatDivider />
         <Stat label="Target rows" value={tgtRows.toLocaleString()} accent="#059669" />
         <StatDivider />
-        <Stat label="Only in src" value={onlySrc.toLocaleString()} color={onlySrc > 0 ? '#DC2626' : '#64748B'} />
+        <Stat label={isPositional ? "Unmatched src" : "Only in src"} value={onlySrc.toLocaleString()} color={onlySrc > 0 ? '#DC2626' : '#64748B'} />
         <StatDivider />
-        <Stat label="Only in tgt" value={onlyTgt.toLocaleString()} color={onlyTgt > 0 ? '#DC2626' : '#64748B'} />
+        <Stat label={isPositional ? "Unmatched tgt" : "Only in tgt"} value={onlyTgt.toLocaleString()} color={onlyTgt > 0 ? '#DC2626' : '#64748B'} />
         <StatDivider />
         <Stat label="Row diffs" value={diffRows.toLocaleString()} color={diffRows > 0 ? '#DC2626' : '#059669'} />
         <StatDivider />
