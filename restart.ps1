@@ -1,4 +1,4 @@
-# restart.ps1 — Full setup + kill existing + restart (Windows PowerShell)
+# restart.ps1 - Full setup + kill existing + restart (Windows PowerShell)
 # Run from the etl_validator project root folder:  .\restart.ps1
 # First-time run does full setup; subsequent runs just restart.
 
@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 
-Write-Host "=== ETL Validator — Windows Setup & Start ===" -ForegroundColor Cyan
+Write-Host "=== ETL Validator - Windows Setup and Start ===" -ForegroundColor Cyan
 Write-Host "Project root: $ProjectRoot"
 
 # ============================================================
@@ -130,7 +130,7 @@ if ($frontendPids) {
 Write-Host "`n[7/7] Starting services..." -ForegroundColor Yellow
 
 # Backend window
-$backendCmd = "cd '$ProjectRoot'; & '$activateScript'; python -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload"
+$backendCmd = "Set-Location '$ProjectRoot'; . '$activateScript'; python -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $backendCmd
 Write-Host "  Backend starting at http://localhost:8000" -ForegroundColor Green
 
@@ -157,4 +157,5 @@ Write-Host "Next time, run with -SkipSetup to skip installs:" -ForegroundColor G
 Write-Host "  .\restart.ps1 -SkipSetup" -ForegroundColor Gray
 Write-Host ""
 Write-Host "If accessing from another machine, allow firewall:" -ForegroundColor Gray
-Write-Host "  New-NetFirewallRule -DisplayName 'ETL Validator' -Direction Inbound -LocalPort 8000,5173 -Protocol TCP -Action Allow" -ForegroundColor Gray
+Write-Host "  New-NetFirewallRule -DisplayName 'ETL Validator' -Direction Inbound" -ForegroundColor Gray
+Write-Host "    -LocalPort 8000,5173 -Protocol TCP -Action Allow" -ForegroundColor Gray
