@@ -262,7 +262,7 @@ try {
 }
 
 # ============================================================
-# STEP 7: Start backend + frontend in new windows
+# STEP 7: Start backend + frontend as background jobs
 # ============================================================
 Write-Host "`n[7/7] Starting services..." -ForegroundColor Yellow
 
@@ -270,22 +270,30 @@ Write-Host "`n[7/7] Starting services..." -ForegroundColor Yellow
 $pythonDir = Split-Path $pythonExe
 $nodeDir = Split-Path $nodeExe
 $npmDir = Split-Path $npmCmd
-$pathForChildren = "$pythonDir;$nodeDir;$npmDir;$env:PATH"
-$pathSetup = "`$env:PATH = '$pathForChildren' + `$env:PATH"
+$env:PATH = "$pythonDir;$nodeDir;$npmDir;" + $env:PATH
 
-# Backend window — must run from PARENT directory so Python finds etl_validator package
+# Backend — must run from PARENT directory so Python finds etl_validator package
 $parentDir = Split-Path $ProjectRoot -Parent
-$backendCmd = "$pathSetup; Set-Location '$parentDir'; & '$venvPythonExe' -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir '$ProjectRoot'"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", $backendCmd
-Write-Host "  Backend starting at http://localhost:8000" -ForegroundColor Green
+$backendJob = Start-Job -Name "ETL-Backend" -ScriptBlock {
+    param($parentDir, $venvPythonExe, $projectRoot, $envPath)
+    $env:PATH = $envPath
+    Set-Location $parentDir
+    & $venvPythonExe -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir $projectRoot
+} -ArgumentList $parentDir, $venvPythonExe, $ProjectRoot, $env:PATH
+Write-Host "  Backend starting at http://localhost:8000 (Job: $($backendJob.Id))" -ForegroundColor Green
 
 # Wait a moment for backend to grab the port
 Start-Sleep -Seconds 3
 
-# Frontend window
-$frontendCmd = "$pathSetup; cd '$(Join-Path $ProjectRoot 'frontend')'; & '$npmCmd' run dev -- --host 0.0.0.0"
-Start-Process powershell -ArgumentList "-NoExit", "-Command", $frontendCmd
-Write-Host "  Frontend starting at http://localhost:5173" -ForegroundColor Green
+# Frontend
+$frontendDir = Join-Path $ProjectRoot "frontend"
+$frontendJob = Start-Job -Name "ETL-Frontend" -ScriptBlock {
+    param($frontendDir, $npmCmd, $envPath)
+    $env:PATH = $envPath
+    Set-Location $frontendDir
+    & $npmCmd run dev -- --host 0.0.0.0
+} -ArgumentList $frontendDir, $npmCmd, $env:PATH
+Write-Host "  Frontend starting at http://localhost:5173 (Job: $($frontendJob.Id))" -ForegroundColor Green
 
 # ============================================================
 # Done
@@ -296,8 +304,13 @@ Write-Host "  Backend API:  http://localhost:8000" -ForegroundColor White
 Write-Host "  API Docs:     http://localhost:8000/docs" -ForegroundColor White
 Write-Host "  Frontend UI:  http://localhost:5173" -ForegroundColor White
 Write-Host ""
-Write-Host "Two PowerShell windows opened (backend + frontend)."
-Write-Host "Close them to stop the servers." -ForegroundColor Gray
+Write-Host "Services running as background jobs (no extra windows)." -ForegroundColor Gray
+Write-Host ""
+Write-Host "Useful commands:" -ForegroundColor Cyan
+Write-Host "  Get-Job                  # Check job status" -ForegroundColor Gray
+Write-Host "  Receive-Job ETL-Backend  # View backend logs" -ForegroundColor Gray
+Write-Host "  Receive-Job ETL-Frontend # View frontend logs" -ForegroundColor Gray
+Write-Host "  Stop-Job *; Remove-Job * # Stop all services" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Auto-detection Summary:" -ForegroundColor Cyan
 Write-Host "  Python:   $pythonExe"
