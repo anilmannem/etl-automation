@@ -1,5 +1,8 @@
 # restart.ps1 - Full setup + kill existing + restart (Windows PowerShell)
-# Run from the etl_validator project root folder:  .\restart.ps1
+# IMPORTANT: The folder MUST be named "etl_validator" for Python imports to work.
+#   git clone https://github.com/anilmannem/etl-automation.git etl_validator
+#   cd etl_validator
+#   .\restart.ps1
 # First-time run does full setup; subsequent runs just restart.
 
 param(
