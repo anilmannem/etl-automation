@@ -274,26 +274,17 @@ $env:PATH = "$pythonDir;$nodeDir;$npmDir;" + $env:PATH
 
 # Backend — must run from PARENT directory so Python finds etl_validator package
 $parentDir = Split-Path $ProjectRoot -Parent
-$backendJob = Start-Job -Name "ETL-Backend" -ScriptBlock {
-    param($parentDir, $venvPythonExe, $projectRoot, $envPath)
-    $env:PATH = $envPath
-    Set-Location $parentDir
-    & $venvPythonExe -m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir $projectRoot
-} -ArgumentList $parentDir, $venvPythonExe, $ProjectRoot, $env:PATH
-Write-Host "  Backend starting at http://localhost:8000 (Job: $($backendJob.Id))" -ForegroundColor Green
+Start-Process -FilePath $venvPythonExe -ArgumentList "-m uvicorn etl_validator.api:app --host 0.0.0.0 --port 8000 --reload --reload-dir `"$ProjectRoot`"" -WorkingDirectory $parentDir -WindowStyle Hidden
+Write-Host "  Backend starting at http://localhost:8000" -ForegroundColor Green
 
 # Wait a moment for backend to grab the port
 Start-Sleep -Seconds 3
 
-# Frontend
+# Frontend — use npx.cmd to run vite dev server
 $frontendDir = Join-Path $ProjectRoot "frontend"
-$frontendJob = Start-Job -Name "ETL-Frontend" -ScriptBlock {
-    param($frontendDir, $npmCmd, $envPath)
-    $env:PATH = $envPath
-    Set-Location $frontendDir
-    & $npmCmd run dev -- --host 0.0.0.0
-} -ArgumentList $frontendDir, $npmCmd, $env:PATH
-Write-Host "  Frontend starting at http://localhost:5173 (Job: $($frontendJob.Id))" -ForegroundColor Green
+$npxCmd = Join-Path (Split-Path $npmCmd) "npx.cmd"
+Start-Process -FilePath $npxCmd -ArgumentList "vite --host 0.0.0.0 --port 5173" -WorkingDirectory $frontendDir -WindowStyle Hidden
+Write-Host "  Frontend starting at http://localhost:5173" -ForegroundColor Green
 
 # ============================================================
 # Done
@@ -304,13 +295,12 @@ Write-Host "  Backend API:  http://localhost:8000" -ForegroundColor White
 Write-Host "  API Docs:     http://localhost:8000/docs" -ForegroundColor White
 Write-Host "  Frontend UI:  http://localhost:5173" -ForegroundColor White
 Write-Host ""
-Write-Host "Services running as background jobs (no extra windows)." -ForegroundColor Gray
+Write-Host "Services running as hidden background processes." -ForegroundColor Gray
 Write-Host ""
 Write-Host "Useful commands:" -ForegroundColor Cyan
-Write-Host "  Get-Job                  # Check job status" -ForegroundColor Gray
-Write-Host "  Receive-Job ETL-Backend  # View backend logs" -ForegroundColor Gray
-Write-Host "  Receive-Job ETL-Frontend # View frontend logs" -ForegroundColor Gray
-Write-Host "  Stop-Job *; Remove-Job * # Stop all services" -ForegroundColor Gray
+Write-Host "  netstat -ano | findstr ':8000'   # Check backend process" -ForegroundColor Gray
+Write-Host "  netstat -ano | findstr ':5173'   # Check frontend process" -ForegroundColor Gray
+Write-Host "  taskkill /F /PID <pid>           # Kill a specific process" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Auto-detection Summary:" -ForegroundColor Cyan
 Write-Host "  Python:   $pythonExe"
