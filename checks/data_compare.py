@@ -337,12 +337,135 @@ class DataCheck(BaseCheck):
         strategy = config.extra.get("strategy", "full")
         sample_pct = config.extra.get("sample_pct", 10)
 
+        # Auto-select minus strategy when both sides are Teradata (same instance)
+        if strategy == "minus" or (
+            strategy == "full"
+            and hasattr(src_conn, 'config') and hasattr(tgt_conn, 'config')
+            and src_conn.config.platform == "teradata"
+            and tgt_conn.config.platform == "teradata"
+            and src_conn.config.dsn == tgt_conn.config.dsn
+        ):
+            return self._minus_strategy(src_conn, tgt_conn, config)
+
         if strategy == "hash":
             return self._hash_strategy(src_conn, tgt_conn, config)
         elif strategy == "sample":
             return self._sample_strategy(src_conn, tgt_conn, config, sample_pct)
         else:
             return self._full_strategy(src_conn, tgt_conn, config)
+
+    # ── Strategy: MINUS (Teradata ↔ Teradata, same instance) ─────────────────
+
+    def _minus_strategy(self, src_conn, tgt_conn, config: CheckConfig) -> CheckResult:
+        """Server-side MINUS in Teradata — only transfers mismatched rows.
+
+        Runs:
+          SELECT cols FROM src MINUS SELECT cols FROM tgt  → rows only in source
+          SELECT cols FROM tgt MINUS SELECT cols FROM src  → rows only in target
+
+        Then performs column-level drill-down on the transferred diff rows
+        using join keys (or positional pairing if no keys).
+        """
+        logger.info("Using MINUS strategy (Teradata server-side diff)")
+
+        src_table = config.source_table
+        tgt_table = config.target_table
+        where = config.where
+        join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else None
+        max_mismatches = config.extra.get("max_mismatches", 10_000)
+
+        # Get columns (from target, excluding ignored)
+        src_cols = tgt_conn.get_column_names(tgt_table, exclude=config.ignore_columns)
+        col_list = ", ".join(f'"{c}"' for c in src_cols)
+        clause = f"WHERE {where}" if where else ""
+
+        # Get row counts first (cheap single-AMP queries)
+        src_count = src_conn.get_row_count(src_table, where)
+        tgt_count = tgt_conn.get_row_count(tgt_table, where)
+
+        # MINUS queries — executed entirely in Teradata
+        minus_src_query = (
+            f"SELECT {col_list} FROM {src_table} {clause} "
+            f"MINUS "
+            f"SELECT {col_list} FROM {tgt_table} {clause}"
+        )
+        minus_tgt_query = (
+            f"SELECT {col_list} FROM {tgt_table} {clause} "
+            f"MINUS "
+            f"SELECT {col_list} FROM {src_table} {clause}"
+        )
+
+        logger.info("Executing MINUS (rows only in source)...")
+        only_in_src_df = src_conn.execute_query(minus_src_query)
+        only_in_src_df.columns = [c.upper() for c in only_in_src_df.columns]
+
+        logger.info("Executing MINUS (rows only in target)...")
+        only_in_tgt_df = tgt_conn.execute_query(minus_tgt_query)
+        only_in_tgt_df.columns = [c.upper() for c in only_in_tgt_df.columns]
+
+        rows_only_src = len(only_in_src_df)
+        rows_only_tgt = len(only_in_tgt_df)
+
+        logger.info("MINUS results: %d only-in-src, %d only-in-tgt (transferred %d rows total)",
+                    rows_only_src, rows_only_tgt, rows_only_src + rows_only_tgt)
+
+        # Auto-detect join keys from the diff rows if not provided
+        if not join_keys and rows_only_src > 0 and rows_only_tgt > 0:
+            join_keys = self._auto_detect_keys_df(only_in_src_df, only_in_tgt_df)
+
+        # Column-level drill-down on the diff rows
+        mismatch_cols = ""
+        col_mismatch_summary = ""
+        details = None
+        rows_with_diffs = 0
+
+        if join_keys and rows_only_src > 0 and rows_only_tgt > 0:
+            # Keyed drill-down: pair by join keys, find which columns differ
+            details, mismatch_cols, col_mismatch_summary = self._column_drill_down(
+                only_in_src_df, only_in_tgt_df, join_keys, config.ignore_columns, max_mismatches
+            )
+            # Rows that paired on keys = changed rows (not truly "only in one side")
+            key_upper = [k.upper() for k in join_keys]
+            paired = only_in_src_df.merge(only_in_tgt_df, on=key_upper, how="inner", suffixes=("", "_"))
+            rows_with_diffs = len(paired)
+            rows_only_src = rows_only_src - rows_with_diffs
+            rows_only_tgt = rows_only_tgt - rows_with_diffs
+        elif rows_only_src > 0 or rows_only_tgt > 0:
+            # No keys — show raw diff rows
+            details = self._build_details(only_in_src_df, only_in_tgt_df, max_mismatches)
+
+        match_pct = _compute_match_pct(src_count, tgt_count, rows_only_src, rows_only_tgt, rows_with_diffs)
+        is_match = rows_only_src == 0 and rows_only_tgt == 0 and rows_with_diffs == 0
+        status = Status.PASS if is_match else Status.FAIL
+
+        key_display = ", ".join(k.upper() for k in join_keys) if join_keys else "none"
+
+        return CheckResult(
+            check_type=self.name,
+            status=status,
+            metrics={
+                "src_row_count": src_count,
+                "tgt_row_count": tgt_count,
+                "rows_only_in_source": rows_only_src,
+                "rows_only_in_target": rows_only_tgt,
+                "rows_with_diffs": rows_with_diffs,
+                "rows_matched": max(src_count, tgt_count) - rows_only_src - rows_only_tgt - rows_with_diffs,
+                "match_pct": match_pct,
+                "mismatch_columns": mismatch_cols,
+                "column_mismatch_summary": col_mismatch_summary,
+                "comparison_mode": "keyed" if join_keys else "positional",
+                "join_keys_used": key_display,
+                "strategy": "minus",
+            },
+            details=details,
+            message=(
+                f"Source={src_count:,}, Target={tgt_count:,}, "
+                f"match={match_pct}%, strategy=MINUS (server-side), "
+                f"keys={key_display}, "
+                f"rows_with_diffs={rows_with_diffs}, "
+                f"Only-in-src={rows_only_src:,}, Only-in-tgt={rows_only_tgt:,}"
+            ),
+        )
 
     # ── Strategy 0: DuckDB-native (CSV / Excel / any DataFrame connector) ─────
 
