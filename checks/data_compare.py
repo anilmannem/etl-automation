@@ -352,11 +352,20 @@ class DataCheck(BaseCheck):
         src_path = getattr(src_conn, "_file_path", None)
         tgt_path = getattr(tgt_conn, "_file_path", None)
 
+        loaded = False
         if src_path and tgt_path:
-            con.execute(f"CREATE VIEW src AS SELECT * FROM read_csv_auto({src_path!r})")
-            con.execute(f"CREATE VIEW tgt AS SELECT * FROM read_csv_auto({tgt_path!r})")
-            logger.debug("DuckDB reading CSV files directly: %s | %s", src_path, tgt_path)
-        else:
+            try:
+                con.execute(f"CREATE VIEW src AS SELECT * FROM read_csv_auto({src_path!r})")
+                con.execute(f"CREATE VIEW tgt AS SELECT * FROM read_csv_auto({tgt_path!r})")
+                loaded = True
+                logger.debug("DuckDB reading CSV files directly: %s | %s", src_path, tgt_path)
+            except Exception as exc:
+                logger.warning("DuckDB direct file read failed (%s), falling back to pandas", exc)
+                # Clean up any partial views
+                con.execute("DROP VIEW IF EXISTS src")
+                con.execute("DROP VIEW IF EXISTS tgt")
+
+        if not loaded:
             src_df = src_conn.read_dataframe()
             tgt_df = tgt_conn.read_dataframe()
             con.register("_src_df", src_df)
