@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Box, Typography, Button, TextField, Select, MenuItem,
   FormControl, InputLabel, Alert, IconButton, Chip, Dialog, DialogTitle,
@@ -10,12 +10,14 @@ import EditRoundedIcon from '@mui/icons-material/EditRounded';
 import DeleteRoundedIcon from '@mui/icons-material/DeleteRounded';
 import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded';
 import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
-import FilterListRoundedIcon from '@mui/icons-material/FilterListRounded';
+import StopCircleRoundedIcon from '@mui/icons-material/StopCircleRounded';
+import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
+import ErrorRoundedIcon from '@mui/icons-material/ErrorRounded';
 import StorageRoundedIcon from '@mui/icons-material/StorageRounded';
 import { EmptyState } from '../components/Shared';
 import {
   listMetadata, createMetadata, updateMetadata, deleteMetadata,
-  bulkImportMetadata, runFromMetadata, listConnections,
+  bulkImportMetadata, runFromMetadata, getBatchProgress, listConnections,
 } from '../api';
 
 const EMPTY_ENTRY = {
@@ -39,7 +41,6 @@ const EMPTY_ENTRY = {
 };
 
 const STRATEGIES = ['auto', 'minus', 'hash', 'full', 'sample'];
-const SCHEDULES = ['hourly', 'daily', 'weekly', 'monthly', 'on-demand'];
 const CHECK_TYPES = ['row_count', 'data', 'schema', 'aggregate', 'null_check', 'duplicate_check'];
 
 function StatsBar({ stats }) {
@@ -86,7 +87,6 @@ function MetadataRow({ entry, onEdit, onDelete, onRun }) {
       </Box>
       <Chip label={entry.strategy} size="small" sx={{ fontSize: 11, height: 22 }} />
       <Chip label={`P${entry.priority}`} size="small" variant="outlined" sx={{ fontSize: 11, height: 22 }} />
-      <Chip label={entry.schedule} size="small" variant="outlined" sx={{ fontSize: 11, height: 22, color: '#8B5CF6' }} />
       {entry.tags && (
         <Chip label={entry.tags.split(',')[0]} size="small" sx={{ fontSize: 10, height: 20, bgcolor: '#EDE9FE' }} />
       )}
@@ -94,6 +94,150 @@ function MetadataRow({ entry, onEdit, onDelete, onRun }) {
       <Tooltip title="Edit"><IconButton size="small" onClick={() => onEdit(entry)}><EditRoundedIcon fontSize="small" /></IconButton></Tooltip>
       <Tooltip title="Delete"><IconButton size="small" onClick={() => onDelete(entry)}><DeleteRoundedIcon fontSize="small" sx={{ color: '#DC2626' }} /></IconButton></Tooltip>
     </Box>
+  );
+}
+
+function BatchProgressPanel({ batchId, onComplete }) {
+  const [progress, setProgress] = useState(null);
+  const [details, setDetails] = useState([]);
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    if (!batchId) return;
+
+    const poll = async () => {
+      try {
+        const res = await getBatchProgress(batchId);
+        setProgress(res.data.progress);
+        setDetails(res.data.details || []);
+
+        // Check if done
+        if (res.data.progress?.pct_done >= 100) {
+          clearInterval(intervalRef.current);
+          onComplete?.(res.data.progress);
+        }
+      } catch (e) {
+        // Batch might have expired — stop polling
+        if (e.response?.status === 404) {
+          clearInterval(intervalRef.current);
+        }
+      }
+    };
+
+    poll(); // immediate first poll
+    intervalRef.current = setInterval(poll, 2000);
+
+    return () => clearInterval(intervalRef.current);
+  }, [batchId]);
+
+  if (!progress) return <LinearProgress sx={{ mb: 2 }} />;
+
+  const isComplete = progress.pct_done >= 100;
+  const hasFailed = progress.failed > 0 || progress.errors > 0;
+
+  return (
+    <Paper elevation={0} sx={{
+      mb: 2, borderRadius: 2, overflow: 'hidden',
+      border: '1px solid',
+      borderColor: isComplete ? (hasFailed ? '#FECACA' : '#BBF7D0') : '#BFDBFE',
+      bgcolor: isComplete ? (hasFailed ? '#FEF2F2' : '#F0FDF4') : '#EFF6FF',
+    }}>
+      {/* Progress Header */}
+      <Box sx={{ px: 2.5, pt: 2, pb: 1.5 }}>
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            {isComplete ? (
+              hasFailed ? <ErrorRoundedIcon sx={{ fontSize: 18, color: '#DC2626' }} />
+                        : <CheckCircleRoundedIcon sx={{ fontSize: 18, color: '#059669' }} />
+            ) : (
+              <CircularProgress size={16} thickness={5} />
+            )}
+            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+              {isComplete ? 'Batch Complete' : 'Executing Validations…'}
+            </Typography>
+          </Box>
+          <Typography variant="caption" sx={{ color: '#64748B', fontFamily: 'monospace' }}>
+            {batchId}
+          </Typography>
+        </Box>
+
+        {/* Progress bar */}
+        {!isComplete && (
+          <Box sx={{ mb: 1.5 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
+              <Typography variant="caption" sx={{ fontWeight: 600 }}>
+                {progress.completed} / {progress.total} tables
+              </Typography>
+              <Typography variant="caption" sx={{ fontWeight: 600, color: '#3B82F6' }}>
+                {progress.pct_done}%
+              </Typography>
+            </Box>
+            <LinearProgress
+              variant="determinate"
+              value={progress.pct_done}
+              sx={{
+                height: 8, borderRadius: 4,
+                bgcolor: '#DBEAFE',
+                '& .MuiLinearProgress-bar': {
+                  borderRadius: 4,
+                  bgcolor: hasFailed ? '#F59E0B' : '#3B82F6',
+                },
+              }}
+            />
+          </Box>
+        )}
+
+        {/* Metrics row */}
+        <Box sx={{ display: 'flex', gap: 3, flexWrap: 'wrap', mt: 1 }}>
+          {!isComplete && progress.running > 0 && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: '#3B82F6', animation: 'pulse 1.5s infinite' }} />
+              <Typography variant="caption" sx={{ fontWeight: 600 }}>{progress.running} running</Typography>
+            </Box>
+          )}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+            <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: '#10B981' }} />
+            <Typography variant="caption" sx={{ fontWeight: 600 }}>{progress.passed} passed</Typography>
+          </Box>
+          {progress.failed > 0 && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: '#DC2626' }} />
+              <Typography variant="caption" sx={{ fontWeight: 600, color: '#DC2626' }}>{progress.failed} failed</Typography>
+            </Box>
+          )}
+          {progress.errors > 0 && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+              <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: '#9333EA' }} />
+              <Typography variant="caption" sx={{ fontWeight: 600, color: '#9333EA' }}>{progress.errors} errors</Typography>
+            </Box>
+          )}
+          {!isComplete && progress.pending > 0 && (
+            <Typography variant="caption" sx={{ color: '#94A3B8' }}>{progress.pending} pending</Typography>
+          )}
+          <Typography variant="caption" sx={{ color: '#64748B', ml: 'auto' }}>
+            {progress.tables_per_min} tables/min • {progress.elapsed_s}s elapsed
+            {!isComplete && progress.est_remaining_s > 0 && ` • ~${Math.round(progress.est_remaining_s)}s remaining`}
+          </Typography>
+        </Box>
+      </Box>
+
+      {/* Failed tables detail (show only failures/errors) */}
+      {details.filter(d => d.status === 'fail' || d.status === 'error').length > 0 && (
+        <Box sx={{ borderTop: '1px solid', borderColor: hasFailed ? '#FECACA' : '#E2E8F0', px: 2.5, py: 1.5, maxHeight: 160, overflow: 'auto' }}>
+          <Typography variant="caption" sx={{ fontWeight: 700, color: '#DC2626', display: 'block', mb: 0.5 }}>
+            Failed Tables
+          </Typography>
+          {details.filter(d => d.status === 'fail' || d.status === 'error').slice(0, 10).map((d, i) => (
+            <Box key={i} sx={{ display: 'flex', alignItems: 'center', gap: 1, py: 0.25 }}>
+              <Typography variant="caption" sx={{ fontFamily: 'monospace', fontWeight: 600 }}>{d.table}</Typography>
+              <Typography variant="caption" sx={{ color: '#64748B', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {d.message}
+              </Typography>
+            </Box>
+          ))}
+        </Box>
+      )}
+    </Paper>
   );
 }
 
@@ -111,6 +255,7 @@ export default function MetadataManager() {
   const [filterGroup, setFilterGroup] = useState('');
   const [showInactive, setShowInactive] = useState(false);
   const [running, setRunning] = useState(false);
+  const [activeBatchId, setActiveBatchId] = useState(null);
   const [runResult, setRunResult] = useState(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const fileInputRef = useRef(null);
@@ -178,13 +323,12 @@ export default function MetadataManager() {
   const handleRunSingle = async (entry) => {
     setRunning(true);
     setRunResult(null);
+    setActiveBatchId(null);
     try {
       const res = await runFromMetadata({ ids: [entry.id], max_workers: 1 });
-      setRunResult(res.data);
-      setSuccess(`Validation complete: ${res.data.passed} passed, ${res.data.failed} failed`);
+      setActiveBatchId(res.data.batch_id);
     } catch (e) {
       setError(e.response?.data?.detail || 'Run failed');
-    } finally {
       setRunning(false);
     }
   };
@@ -192,20 +336,24 @@ export default function MetadataManager() {
   const handleRunGroup = async () => {
     setRunning(true);
     setRunResult(null);
+    setActiveBatchId(null);
     try {
       const res = await runFromMetadata({
         group_name: filterGroup || '',
         max_workers: 20,
         parallel: true,
       });
-      setRunResult(res.data);
-      const rate = res.data.tables_per_minute ? ` (${res.data.tables_per_minute} tables/min)` : '';
-      setSuccess(`Batch complete: ${res.data.passed}/${res.data.total} passed in ${res.data.duration_s}s${rate}`);
+      setActiveBatchId(res.data.batch_id);
     } catch (e) {
       setError(e.response?.data?.detail || 'Batch run failed');
-    } finally {
       setRunning(false);
     }
+  };
+
+  const handleBatchComplete = (finalProgress) => {
+    setRunning(false);
+    setRunResult(finalProgress);
+    setSuccess(`Batch complete: ${finalProgress.passed}/${finalProgress.total} passed • ${finalProgress.tables_per_min} tables/min`);
   };
 
   const handleFileImport = async (e) => {
@@ -252,7 +400,7 @@ export default function MetadataManager() {
           <Button variant="outlined" startIcon={<UploadFileRoundedIcon />} onClick={() => setImportDialogOpen(true)}>
             Import
           </Button>
-          <Button variant="outlined" color="success" startIcon={<PlayArrowRoundedIcon />}
+          <Button variant="outlined" color="success" startIcon={running ? <CircularProgress size={16} /> : <PlayArrowRoundedIcon />}
             onClick={handleRunGroup} disabled={running}>
             {running ? 'Running…' : `Run ${filterGroup || 'All'}`}
           </Button>
@@ -287,34 +435,10 @@ export default function MetadataManager() {
         </Typography>
       </Box>
 
-      {/* Run Results Banner */}
-      {runResult && (
-        <Paper elevation={0} sx={{ mb: 2, p: 2, borderRadius: 2, border: '1px solid',
-          borderColor: runResult.failed > 0 ? '#FECACA' : '#BBF7D0',
-          bgcolor: runResult.failed > 0 ? '#FEF2F2' : '#F0FDF4',
-        }}>
-          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
-            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
-              Batch {runResult.batch_id} — {runResult.total} tables validated
-            </Typography>
-            <IconButton size="small" onClick={() => setRunResult(null)}>×</IconButton>
-          </Box>
-          <Box sx={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-            <Typography variant="body2"><strong>{runResult.passed}</strong> passed</Typography>
-            <Typography variant="body2" sx={{ color: '#DC2626' }}><strong>{runResult.failed}</strong> failed</Typography>
-            <Typography variant="body2" sx={{ color: '#9333EA' }}><strong>{runResult.errors}</strong> errors</Typography>
-            {runResult.skipped > 0 && <Typography variant="body2"><strong>{runResult.skipped}</strong> skipped</Typography>}
-            <Typography variant="body2" sx={{ color: '#64748B' }}>{runResult.duration_s}s total</Typography>
-            {runResult.tables_per_minute > 0 && (
-              <Typography variant="body2" sx={{ color: '#0EA5E9', fontWeight: 600 }}>
-                {runResult.tables_per_minute} tables/min
-              </Typography>
-            )}
-          </Box>
-        </Paper>
+      {/* Live Batch Progress Panel */}
+      {activeBatchId && (
+        <BatchProgressPanel batchId={activeBatchId} onComplete={handleBatchComplete} />
       )}
-
-      {running && <LinearProgress sx={{ mb: 2 }} />}
 
       {/* Table List */}
       {loading ? (
@@ -332,7 +456,6 @@ export default function MetadataManager() {
             <Typography variant="caption" sx={{ flex: 1, fontWeight: 600, color: '#475569' }}>Table Pair</Typography>
             <Typography variant="caption" sx={{ width: 80, fontWeight: 600, color: '#475569' }}>Strategy</Typography>
             <Typography variant="caption" sx={{ width: 60, fontWeight: 600, color: '#475569' }}>Priority</Typography>
-            <Typography variant="caption" sx={{ width: 80, fontWeight: 600, color: '#475569' }}>Schedule</Typography>
             <Typography variant="caption" sx={{ width: 140, fontWeight: 600, color: '#475569', textAlign: 'right' }}>Actions</Typography>
           </Box>
           {entries.map((entry) => (
@@ -358,7 +481,7 @@ export default function MetadataManager() {
           <Typography variant="overline" sx={{ color: '#8B5CF6', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
             General
           </Typography>
-          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 2, mb: 3 }}>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 2, mb: 3 }}>
             <Box sx={{ gridColumn: 'span 2' }}>
               <TextField fullWidth label="Group Name" size="small" value={form.group_name}
                 onChange={(e) => setForm({ ...form, group_name: e.target.value })} />
@@ -367,12 +490,6 @@ export default function MetadataManager() {
               <InputLabel>Strategy</InputLabel>
               <Select value={form.strategy} label="Strategy" onChange={(e) => setForm({ ...form, strategy: e.target.value })}>
                 {STRATEGIES.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
-              </Select>
-            </FormControl>
-            <FormControl fullWidth size="small">
-              <InputLabel>Schedule</InputLabel>
-              <Select value={form.schedule} label="Schedule" onChange={(e) => setForm({ ...form, schedule: e.target.value })}>
-                {SCHEDULES.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
               </Select>
             </FormControl>
           </Box>
@@ -426,40 +543,6 @@ export default function MetadataManager() {
             <TextField fullWidth label="Ignore Columns" size="small" value={form.ignore_columns}
               onChange={(e) => setForm({ ...form, ignore_columns: e.target.value })}
               helperText="Columns to skip during comparison" />
-          </Box>
-
-          {/* Section: Advanced Options */}
-          <Typography variant="overline" sx={{ color: '#F59E0B', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
-            Advanced Options
-          </Typography>
-          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 2, mb: 3 }}>
-            <TextField fullWidth label="Priority" size="small" type="number" value={form.priority}
-              onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })}
-              helperText="Higher = run first" />
-            <TextField fullWidth label="Tolerance" size="small" type="number" value={form.tolerance}
-              onChange={(e) => setForm({ ...form, tolerance: Number(e.target.value) })}
-              helperText="Acceptable diff %" />
-            <TextField fullWidth label="Timestamp Col" size="small" value={form.timestamp_column}
-              onChange={(e) => setForm({ ...form, timestamp_column: e.target.value })}
-              helperText="For incremental" />
-            <FormControlLabel
-              control={<Switch checked={form.active} onChange={(e) => setForm({ ...form, active: e.target.checked })} color="success" />}
-              label="Active"
-              sx={{ ml: 0 }}
-            />
-          </Box>
-
-          {/* Section: Labels */}
-          <Typography variant="overline" sx={{ color: '#64748B', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
-            Labels & Notes
-          </Typography>
-          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 2 }}>
-            <TextField fullWidth label="Tags" size="small" value={form.tags}
-              onChange={(e) => setForm({ ...form, tags: e.target.value })}
-              placeholder="finance, critical" />
-            <TextField fullWidth label="Notes" size="small" value={form.notes}
-              onChange={(e) => setForm({ ...form, notes: e.target.value })}
-              placeholder="Any additional context..." />
           </Box>
         </DialogContent>
         <DialogActions sx={{ px: 3, pb: 2.5, pt: 1 }}>

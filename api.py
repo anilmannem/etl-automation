@@ -868,14 +868,15 @@ def bulk_import_metadata(req: BulkImportRequest):
 
 @app.post("/api/metadata/run")
 def run_from_metadata(req: RunFromMetadataRequest):
-    """Run validations from metadata entries in parallel using the batch engine.
+    """Start batch validation asynchronously.
 
-    Uses connection pooling + ThreadPool for 3000+ table throughput.
-    Returns batch_id for progress polling via GET /api/metadata/run/{batch_id}.
+    Returns batch_id immediately. Poll GET /api/metadata/run/{batch_id} for progress.
     """
+    import threading
+
     try:
         from etl_validator.engine.intelligent import IntelligentStore
-        from etl_validator.engine.batch import execute_batch, BatchConfig
+        from etl_validator.engine.batch import execute_batch, BatchConfig, BatchTracker, _active_batches, _batches_lock
 
         store = IntelligentStore()
 
@@ -921,9 +922,30 @@ def run_from_metadata(req: RunFromMetadataRequest):
             priority_order=True,
         )
 
-        # Execute batch in parallel
-        result = execute_batch(entries, connections_map, batch_config)
-        return result
+        # Pre-register tracker so progress is available immediately
+        batch_id = uuid.uuid4().hex[:12]
+        tracker = BatchTracker(batch_id, len(entries))
+        for entry in entries:
+            tracker.register(entry["source_table"], entry.get("group_name", ""))
+        with _batches_lock:
+            _active_batches[batch_id] = tracker
+
+        # Run batch in background thread
+        def _run_batch():
+            try:
+                execute_batch(entries, connections_map, batch_config, batch_id=batch_id)
+            except Exception as e:
+                log.exception("Background batch %s failed: %s", batch_id, e)
+
+        thread = threading.Thread(target=_run_batch, daemon=True, name=f"batch-{batch_id}")
+        thread.start()
+
+        return {
+            "batch_id": batch_id,
+            "total": len(entries),
+            "status": "started",
+            "message": f"Batch started with {len(entries)} tables, {req.max_workers} parallel workers",
+        }
 
     except HTTPException:
         raise

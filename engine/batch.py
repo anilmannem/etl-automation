@@ -396,6 +396,7 @@ def execute_batch(
     entries: list[dict],
     connections_map: dict[str, tuple[str, ConnectionConfig]],
     config: BatchConfig | None = None,
+    batch_id: str | None = None,
 ) -> dict:
     """Execute batch validation of multiple table pairs in parallel.
 
@@ -404,13 +405,14 @@ def execute_batch(
     entries : list of metadata dicts (from validation_metadata table)
     connections_map : {connection_name: (platform, ConnectionConfig)}
     config : batch execution configuration
+    batch_id : optional pre-assigned batch ID (for async mode where tracker is pre-registered)
 
     Returns
     -------
     dict with batch_id, progress, and per-table results
     """
     config = config or BatchConfig()
-    batch_id = uuid.uuid4().hex[:12]
+    batch_id = batch_id or uuid.uuid4().hex[:12]
 
     # Sort by priority
     if config.priority_order:
@@ -430,21 +432,22 @@ def execute_batch(
     if not valid_entries:
         return {"batch_id": batch_id, "error": "No valid entries to execute"}
 
-    # Initialize pool and tracker
+    # Initialize pool; reuse existing tracker if pre-registered, else create new
     pool = ConnectionPool(max_per_key=config.max_connections_per_db)
-    tracker = BatchTracker(batch_id, len(valid_entries))
+
+    with _batches_lock:
+        tracker = _active_batches.get(batch_id)
+
+    if not tracker:
+        tracker = BatchTracker(batch_id, len(valid_entries))
+        for entry in valid_entries:
+            tracker.register(entry["source_table"], entry.get("group_name", ""))
+        with _batches_lock:
+            _active_batches[batch_id] = tracker
 
     # Register connections in pool
     for name, (platform, cfg) in connections_map.items():
         pool.register(platform, cfg)
-
-    # Register entries in tracker
-    for entry in valid_entries:
-        tracker.register(entry["source_table"], entry.get("group_name", ""))
-
-    # Store tracker for progress polling
-    with _batches_lock:
-        _active_batches[batch_id] = tracker
 
     logger.info("BATCH %s: Starting %d table validations (parallel=%d, pool=%d/db)",
                 batch_id, len(valid_entries), config.max_parallel, config.max_connections_per_db)
