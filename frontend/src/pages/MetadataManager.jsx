@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   Box, Typography, Button, TextField, Select, MenuItem,
-  FormControl, InputLabel, Alert, IconButton, Chip, Dialog, DialogTitle,
+  FormControl, InputLabel, Alert, IconButton, Dialog, DialogTitle,
   DialogContent, DialogActions, CircularProgress, Tooltip, Switch,
   FormControlLabel, LinearProgress, Paper,
 } from '@mui/material';
@@ -10,7 +10,7 @@ import EditRoundedIcon from '@mui/icons-material/EditRounded';
 import DeleteRoundedIcon from '@mui/icons-material/DeleteRounded';
 import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded';
 import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
-import StopCircleRoundedIcon from '@mui/icons-material/StopCircleRounded';
+
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
 import ErrorRoundedIcon from '@mui/icons-material/ErrorRounded';
 import StorageRoundedIcon from '@mui/icons-material/StorageRounded';
@@ -46,22 +46,16 @@ const CHECK_TYPES = ['row_count', 'data', 'schema', 'aggregate', 'null_check', '
 function StatsBar({ stats }) {
   if (!stats) return null;
   return (
-    <Box sx={{ display: 'flex', gap: 2, mb: 2, flexWrap: 'wrap' }}>
+    <Box sx={{ display: 'flex', gap: 1.5, mb: 2, flexWrap: 'wrap' }}>
       {[
-        { label: 'Total', value: stats.total, color: '#3B82F6' },
+        { label: 'Tables', value: stats.total, color: '#3B82F6' },
         { label: 'Active', value: stats.active, color: '#10B981' },
         { label: 'Groups', value: stats.groups, color: '#8B5CF6' },
-        { label: 'Sources', value: stats.source_connections, color: '#F59E0B' },
-        { label: 'Targets', value: stats.target_connections, color: '#EC4899' },
       ].map((s) => (
-        <Paper key={s.label} elevation={0} sx={{
-          px: 2, py: 1, borderRadius: 2, bgcolor: '#F8FAFC',
-          border: '1px solid #E2E8F0', display: 'flex', alignItems: 'center', gap: 1,
-        }}>
-          <Box sx={{ width: 8, height: 8, borderRadius: '50%', bgcolor: s.color }} />
-          <Typography variant="caption" sx={{ color: '#64748B' }}>{s.label}</Typography>
-          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>{s.value ?? 0}</Typography>
-        </Paper>
+        <Box key={s.label} sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+          <Box sx={{ width: 6, height: 6, borderRadius: '50%', bgcolor: s.color }} />
+          <Typography variant="caption" sx={{ color: '#64748B', fontWeight: 500 }}>{s.value ?? 0} {s.label}</Typography>
+        </Box>
       ))}
     </Box>
   );
@@ -70,29 +64,24 @@ function StatsBar({ stats }) {
 function MetadataRow({ entry, onEdit, onDelete, onRun }) {
   return (
     <Box sx={{
-      display: 'flex', alignItems: 'center', gap: 1.5, px: 2, py: 1.5,
+      display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1.25,
       borderBottom: '1px solid #F1F5F9',
       '&:hover': { bgcolor: '#F8FAFC' },
       opacity: entry.active ? 1 : 0.5,
     }}>
-      <StorageRoundedIcon sx={{ fontSize: 18, color: '#94A3B8' }} />
       <Box sx={{ flex: 1, minWidth: 0 }}>
-        <Typography variant="body2" sx={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <Typography variant="body2" sx={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {entry.source_table} → {entry.target_table}
         </Typography>
-        <Typography variant="caption" sx={{ color: '#64748B' }}>
+        <Typography variant="caption" sx={{ color: '#94A3B8', fontSize: 11 }}>
           {entry.source_connection} → {entry.target_connection}
           {entry.group_name && entry.group_name !== 'default' && ` • ${entry.group_name}`}
         </Typography>
       </Box>
-      <Chip label={entry.strategy} size="small" sx={{ fontSize: 11, height: 22 }} />
-      <Chip label={`P${entry.priority}`} size="small" variant="outlined" sx={{ fontSize: 11, height: 22 }} />
-      {entry.tags && (
-        <Chip label={entry.tags.split(',')[0]} size="small" sx={{ fontSize: 10, height: 20, bgcolor: '#EDE9FE' }} />
-      )}
-      <Tooltip title="Run Validation"><IconButton size="small" onClick={() => onRun(entry)}><PlayArrowRoundedIcon fontSize="small" sx={{ color: '#10B981' }} /></IconButton></Tooltip>
-      <Tooltip title="Edit"><IconButton size="small" onClick={() => onEdit(entry)}><EditRoundedIcon fontSize="small" /></IconButton></Tooltip>
-      <Tooltip title="Delete"><IconButton size="small" onClick={() => onDelete(entry)}><DeleteRoundedIcon fontSize="small" sx={{ color: '#DC2626' }} /></IconButton></Tooltip>
+      <Typography variant="caption" sx={{ color: '#64748B', fontSize: 11, px: 1 }}>{entry.strategy}</Typography>
+      <Tooltip title="Run"><IconButton size="small" onClick={() => onRun(entry)}><PlayArrowRoundedIcon sx={{ fontSize: 18, color: '#10B981' }} /></IconButton></Tooltip>
+      <Tooltip title="Edit"><IconButton size="small" onClick={() => onEdit(entry)}><EditRoundedIcon sx={{ fontSize: 16, color: '#94A3B8' }} /></IconButton></Tooltip>
+      <Tooltip title="Delete"><IconButton size="small" onClick={() => onDelete(entry)}><DeleteRoundedIcon sx={{ fontSize: 16, color: '#94A3B8' }} /></IconButton></Tooltip>
     </Box>
   );
 }
@@ -389,23 +378,27 @@ export default function MetadataManager() {
   return (
     <Box sx={{ height: '100%', overflow: 'auto', p: 3 }}>
       {/* Header */}
-      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2 }}>
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 2.5 }}>
         <Box>
-          <Typography variant="h5" sx={{ fontWeight: 700 }}>Validation Metadata</Typography>
-          <Typography variant="body2" sx={{ color: '#64748B' }}>
-            Centralized validation registry — define, organize, and execute table validations at scale
+          <Typography variant="h5" sx={{ fontWeight: 700, fontSize: 22 }}>Validations</Typography>
+          <Typography variant="body2" sx={{ color: '#94A3B8', fontSize: 13 }}>
+            Define table pairs and run at scale
           </Typography>
         </Box>
-        <Box sx={{ display: 'flex', gap: 1 }}>
-          <Button variant="outlined" startIcon={<UploadFileRoundedIcon />} onClick={() => setImportDialogOpen(true)}>
+        <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+          <Button size="small" sx={{ color: '#64748B', textTransform: 'none' }} startIcon={<UploadFileRoundedIcon sx={{ fontSize: 16 }} />}
+            onClick={() => setImportDialogOpen(true)}>
             Import
           </Button>
-          <Button variant="outlined" color="success" startIcon={running ? <CircularProgress size={16} /> : <PlayArrowRoundedIcon />}
-            onClick={handleRunGroup} disabled={running}>
-            {running ? 'Running…' : `Run ${filterGroup || 'All'}`}
+          <Button size="small" sx={{ color: '#64748B', textTransform: 'none' }} startIcon={<AddRoundedIcon sx={{ fontSize: 16 }} />}
+            onClick={openCreate}>
+            Add
           </Button>
-          <Button variant="contained" startIcon={<AddRoundedIcon />} onClick={openCreate}>
-            Add Entry
+          <Button variant="contained" color="success" disableElevation
+            startIcon={running ? <CircularProgress size={14} color="inherit" /> : <PlayArrowRoundedIcon />}
+            onClick={handleRunGroup} disabled={running}
+            sx={{ borderRadius: 2, px: 2.5, textTransform: 'none', fontWeight: 600 }}>
+            {running ? 'Running…' : `Run ${filterGroup || 'All'}`}
           </Button>
         </Box>
       </Box>
@@ -419,20 +412,17 @@ export default function MetadataManager() {
 
       {/* Filters */}
       <Box sx={{ display: 'flex', gap: 2, mb: 2, alignItems: 'center' }}>
-        <FormControl size="small" sx={{ minWidth: 160 }}>
-          <InputLabel>Group Filter</InputLabel>
-          <Select value={filterGroup} label="Group Filter" onChange={(e) => setFilterGroup(e.target.value)}>
-            <MenuItem value="">All Groups</MenuItem>
+        <FormControl size="small" sx={{ minWidth: 140 }}>
+          <InputLabel>Group</InputLabel>
+          <Select value={filterGroup} label="Group" onChange={(e) => setFilterGroup(e.target.value)}>
+            <MenuItem value="">All</MenuItem>
             {groups.map(g => <MenuItem key={g} value={g}>{g}</MenuItem>)}
           </Select>
         </FormControl>
         <FormControlLabel
           control={<Switch checked={showInactive} onChange={(e) => setShowInactive(e.target.checked)} size="small" />}
-          label="Show Inactive"
+          label={<Typography variant="caption" sx={{ color: '#94A3B8' }}>Inactive</Typography>}
         />
-        <Typography variant="caption" sx={{ color: '#94A3B8', ml: 'auto' }}>
-          {entries.length} entries
-        </Typography>
       </Box>
 
       {/* Live Batch Progress Panel */}
@@ -446,18 +436,11 @@ export default function MetadataManager() {
       ) : entries.length === 0 ? (
         <EmptyState
           icon={StorageRoundedIcon}
-          title="No metadata entries"
-          subtitle="Add validation entries or import from CSV/JSON"
+          title="No validations configured"
+          subtitle="Import a CSV with your table pairs or add entries manually"
         />
       ) : (
         <Paper elevation={0} sx={{ border: '1px solid #E2E8F0', borderRadius: 2, overflow: 'hidden' }}>
-          {/* Header row */}
-          <Box sx={{ display: 'flex', px: 2, py: 1, bgcolor: '#F8FAFC', borderBottom: '1px solid #E2E8F0' }}>
-            <Typography variant="caption" sx={{ flex: 1, fontWeight: 600, color: '#475569' }}>Table Pair</Typography>
-            <Typography variant="caption" sx={{ width: 80, fontWeight: 600, color: '#475569' }}>Strategy</Typography>
-            <Typography variant="caption" sx={{ width: 60, fontWeight: 600, color: '#475569' }}>Priority</Typography>
-            <Typography variant="caption" sx={{ width: 140, fontWeight: 600, color: '#475569', textAlign: 'right' }}>Actions</Typography>
-          </Box>
           {entries.map((entry) => (
             <MetadataRow
               key={entry.id}

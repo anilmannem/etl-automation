@@ -11,7 +11,7 @@ const NAV = [
   { label: 'Dashboard', icon: DashboardRoundedIcon, path: '/' },
   { label: 'Test Suite', icon: PlayCircleFilledRoundedIcon, path: '/suite' },
   { label: 'Connections', icon: CableRoundedIcon, path: '/connections' },
-  { label: 'Metadata', icon: TableChartRoundedIcon, path: '/metadata' },
+  { label: 'Validations', icon: TableChartRoundedIcon, path: '/metadata' },
 ];
 
 const NAVY_HOVER = '#525B7E';
