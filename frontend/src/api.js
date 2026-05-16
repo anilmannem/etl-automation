@@ -34,6 +34,7 @@ export const createMetadata = (data) => api.post('/api/metadata', data);
 export const updateMetadata = (id, data) => api.put(`/api/metadata/${id}`, data);
 export const deleteMetadata = (id) => api.delete(`/api/metadata/${id}`);
 export const bulkImportMetadata = (entries) => api.post('/api/metadata/bulk-import', { entries });
-export const runFromMetadata = (data) => api.post('/api/metadata/run', data);
+export const runFromMetadata = (data) => api.post('/api/metadata/run', data, { timeout: 600000 });
+export const getBatchProgress = (batchId) => api.get(`/api/metadata/run/${batchId}`);
 
 export default api;

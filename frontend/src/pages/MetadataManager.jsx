@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import {
-  Box, Typography, Button, TextField, Grid, Select, MenuItem,
+  Box, Typography, Button, TextField, Select, MenuItem,
   FormControl, InputLabel, Alert, IconButton, Chip, Dialog, DialogTitle,
   DialogContent, DialogActions, CircularProgress, Tooltip, Switch,
-  FormControlLabel, Tab, Tabs, LinearProgress, Paper,
+  FormControlLabel, LinearProgress, Paper,
 } from '@mui/material';
 import AddRoundedIcon from '@mui/icons-material/AddRounded';
 import EditRoundedIcon from '@mui/icons-material/EditRounded';
@@ -179,7 +179,7 @@ export default function MetadataManager() {
     setRunning(true);
     setRunResult(null);
     try {
-      const res = await runFromMetadata({ ids: [entry.id] });
+      const res = await runFromMetadata({ ids: [entry.id], max_workers: 1 });
       setRunResult(res.data);
       setSuccess(`Validation complete: ${res.data.passed} passed, ${res.data.failed} failed`);
     } catch (e) {
@@ -193,9 +193,14 @@ export default function MetadataManager() {
     setRunning(true);
     setRunResult(null);
     try {
-      const res = await runFromMetadata({ group_name: filterGroup || '' });
+      const res = await runFromMetadata({
+        group_name: filterGroup || '',
+        max_workers: 20,
+        parallel: true,
+      });
       setRunResult(res.data);
-      setSuccess(`Batch complete: ${res.data.passed}/${res.data.total} passed`);
+      const rate = res.data.tables_per_minute ? ` (${res.data.tables_per_minute} tables/min)` : '';
+      setSuccess(`Batch complete: ${res.data.passed}/${res.data.total} passed in ${res.data.duration_s}s${rate}`);
     } catch (e) {
       setError(e.response?.data?.detail || 'Batch run failed');
     } finally {
@@ -240,7 +245,7 @@ export default function MetadataManager() {
         <Box>
           <Typography variant="h5" sx={{ fontWeight: 700 }}>Validation Metadata</Typography>
           <Typography variant="body2" sx={{ color: '#64748B' }}>
-            Manage all table validations from one place — no YAML needed
+            Centralized validation registry — define, organize, and execute table validations at scale
           </Typography>
         </Box>
         <Box sx={{ display: 'flex', gap: 1 }}>
@@ -284,9 +289,29 @@ export default function MetadataManager() {
 
       {/* Run Results Banner */}
       {runResult && (
-        <Alert severity={runResult.failed > 0 ? 'warning' : 'success'} sx={{ mb: 2 }} onClose={() => setRunResult(null)}>
-          Batch {runResult.batch_id}: {runResult.passed} passed, {runResult.failed} failed, {runResult.errors} errors
-        </Alert>
+        <Paper elevation={0} sx={{ mb: 2, p: 2, borderRadius: 2, border: '1px solid',
+          borderColor: runResult.failed > 0 ? '#FECACA' : '#BBF7D0',
+          bgcolor: runResult.failed > 0 ? '#FEF2F2' : '#F0FDF4',
+        }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+            <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+              Batch {runResult.batch_id} — {runResult.total} tables validated
+            </Typography>
+            <IconButton size="small" onClick={() => setRunResult(null)}>×</IconButton>
+          </Box>
+          <Box sx={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
+            <Typography variant="body2"><strong>{runResult.passed}</strong> passed</Typography>
+            <Typography variant="body2" sx={{ color: '#DC2626' }}><strong>{runResult.failed}</strong> failed</Typography>
+            <Typography variant="body2" sx={{ color: '#9333EA' }}><strong>{runResult.errors}</strong> errors</Typography>
+            {runResult.skipped > 0 && <Typography variant="body2"><strong>{runResult.skipped}</strong> skipped</Typography>}
+            <Typography variant="body2" sx={{ color: '#64748B' }}>{runResult.duration_s}s total</Typography>
+            {runResult.tables_per_minute > 0 && (
+              <Typography variant="body2" sx={{ color: '#0EA5E9', fontWeight: 600 }}>
+                {runResult.tables_per_minute} tables/min
+              </Typography>
+            )}
+          </Box>
+        </Paper>
       )}
 
       {running && <LinearProgress sx={{ mb: 2 }} />}
@@ -296,7 +321,7 @@ export default function MetadataManager() {
         <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}><CircularProgress /></Box>
       ) : entries.length === 0 ? (
         <EmptyState
-          icon={<StorageRoundedIcon sx={{ fontSize: 48, color: '#CBD5E1' }} />}
+          icon={StorageRoundedIcon}
           title="No metadata entries"
           subtitle="Add validation entries or import from CSV/JSON"
         />
@@ -323,121 +348,123 @@ export default function MetadataManager() {
       )}
 
       {/* Add/Edit Dialog */}
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth>
-        <DialogTitle>{editEntry ? 'Edit Validation Entry' : 'Add Validation Entry'}</DialogTitle>
-        <DialogContent sx={{ pt: 2 }}>
-          <Grid container spacing={2} sx={{ mt: 0.5 }}>
-            <Grid item xs={6}>
+      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="md" fullWidth
+        slotProps={{ paper: { sx: { borderRadius: 3, maxHeight: '90vh' } } }}>
+        <DialogTitle sx={{ pb: 1, fontWeight: 700 }}>
+          {editEntry ? 'Edit Validation Entry' : 'Add Validation Entry'}
+        </DialogTitle>
+        <DialogContent sx={{ pt: '8px !important' }}>
+          {/* Section: General */}
+          <Typography variant="overline" sx={{ color: '#8B5CF6', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
+            General
+          </Typography>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 2, mb: 3 }}>
+            <Box sx={{ gridColumn: 'span 2' }}>
               <TextField fullWidth label="Group Name" size="small" value={form.group_name}
                 onChange={(e) => setForm({ ...form, group_name: e.target.value })} />
-            </Grid>
-            <Grid item xs={3}>
-              <FormControl fullWidth size="small">
-                <InputLabel>Strategy</InputLabel>
-                <Select value={form.strategy} label="Strategy" onChange={(e) => setForm({ ...form, strategy: e.target.value })}>
-                  {STRATEGIES.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
-                </Select>
-              </FormControl>
-            </Grid>
-            <Grid item xs={3}>
-              <FormControl fullWidth size="small">
-                <InputLabel>Schedule</InputLabel>
-                <Select value={form.schedule} label="Schedule" onChange={(e) => setForm({ ...form, schedule: e.target.value })}>
-                  {SCHEDULES.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
-                </Select>
-              </FormControl>
-            </Grid>
+            </Box>
+            <FormControl fullWidth size="small">
+              <InputLabel>Strategy</InputLabel>
+              <Select value={form.strategy} label="Strategy" onChange={(e) => setForm({ ...form, strategy: e.target.value })}>
+                {STRATEGIES.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <FormControl fullWidth size="small">
+              <InputLabel>Schedule</InputLabel>
+              <Select value={form.schedule} label="Schedule" onChange={(e) => setForm({ ...form, schedule: e.target.value })}>
+                {SCHEDULES.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Box>
 
-            {/* Source */}
-            <Grid item xs={6}>
-              <FormControl fullWidth size="small">
-                <InputLabel>Source Connection</InputLabel>
-                <Select value={form.source_connection} label="Source Connection"
-                  onChange={(e) => setForm({ ...form, source_connection: e.target.value })}>
-                  {connections.map(c => <MenuItem key={c.id} value={c.name}>{c.name} ({c.platform})</MenuItem>)}
-                </Select>
-              </FormControl>
-            </Grid>
-            <Grid item xs={6}>
-              <TextField fullWidth label="Source Table" size="small" value={form.source_table}
-                onChange={(e) => setForm({ ...form, source_table: e.target.value })}
-                placeholder="schema.table_name" />
-            </Grid>
+          {/* Section: Source & Target */}
+          <Typography variant="overline" sx={{ color: '#0EA5E9', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
+            Source & Target
+          </Typography>
+          <Box sx={{
+            display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 3,
+            p: 2, borderRadius: 2, bgcolor: '#F8FAFC', border: '1px solid #E2E8F0',
+          }}>
+            <FormControl fullWidth size="small">
+              <InputLabel>Source Connection</InputLabel>
+              <Select value={form.source_connection} label="Source Connection"
+                onChange={(e) => setForm({ ...form, source_connection: e.target.value })}>
+                {connections.map(c => <MenuItem key={c.id} value={c.name}>{c.name} ({c.platform})</MenuItem>)}
+              </Select>
+            </FormControl>
+            <FormControl fullWidth size="small">
+              <InputLabel>Target Connection</InputLabel>
+              <Select value={form.target_connection} label="Target Connection"
+                onChange={(e) => setForm({ ...form, target_connection: e.target.value })}>
+                {connections.map(c => <MenuItem key={c.id} value={c.name}>{c.name} ({c.platform})</MenuItem>)}
+              </Select>
+            </FormControl>
+            <TextField fullWidth label="Source Table" size="small" value={form.source_table}
+              onChange={(e) => setForm({ ...form, source_table: e.target.value })}
+              placeholder="database.schema.table" />
+            <TextField fullWidth label="Target Table" size="small" value={form.target_table}
+              onChange={(e) => setForm({ ...form, target_table: e.target.value })}
+              placeholder="database.schema.table" />
+          </Box>
 
-            {/* Target */}
-            <Grid item xs={6}>
-              <FormControl fullWidth size="small">
-                <InputLabel>Target Connection</InputLabel>
-                <Select value={form.target_connection} label="Target Connection"
-                  onChange={(e) => setForm({ ...form, target_connection: e.target.value })}>
-                  {connections.map(c => <MenuItem key={c.id} value={c.name}>{c.name} ({c.platform})</MenuItem>)}
-                </Select>
-              </FormControl>
-            </Grid>
-            <Grid item xs={6}>
-              <TextField fullWidth label="Target Table" size="small" value={form.target_table}
-                onChange={(e) => setForm({ ...form, target_table: e.target.value })}
-                placeholder="schema.table_name" />
-            </Grid>
+          {/* Section: Validation Config */}
+          <Typography variant="overline" sx={{ color: '#10B981', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
+            Validation Configuration
+          </Typography>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 3 }}>
+            <TextField fullWidth label="Join Keys" size="small" value={form.join_keys}
+              onChange={(e) => setForm({ ...form, join_keys: e.target.value })}
+              placeholder="id, order_id"
+              helperText="Comma-separated primary/join keys" />
+            <TextField fullWidth label="Check Types" size="small" value={form.check_types}
+              onChange={(e) => setForm({ ...form, check_types: e.target.value })}
+              placeholder="row_count, data, schema"
+              helperText="Comma-separated check types to run" />
+            <TextField fullWidth label="WHERE Clause" size="small" value={form.where_clause}
+              onChange={(e) => setForm({ ...form, where_clause: e.target.value })}
+              placeholder="status = 'ACTIVE'" />
+            <TextField fullWidth label="Ignore Columns" size="small" value={form.ignore_columns}
+              onChange={(e) => setForm({ ...form, ignore_columns: e.target.value })}
+              helperText="Columns to skip during comparison" />
+          </Box>
 
-            {/* Keys & Checks */}
-            <Grid item xs={6}>
-              <TextField fullWidth label="Join Keys (comma-separated)" size="small" value={form.join_keys}
-                onChange={(e) => setForm({ ...form, join_keys: e.target.value })}
-                placeholder="id, order_id" />
-            </Grid>
-            <Grid item xs={6}>
-              <TextField fullWidth label="Check Types (comma-separated)" size="small" value={form.check_types}
-                onChange={(e) => setForm({ ...form, check_types: e.target.value })}
-                placeholder="row_count,data,schema" />
-            </Grid>
+          {/* Section: Advanced Options */}
+          <Typography variant="overline" sx={{ color: '#F59E0B', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
+            Advanced Options
+          </Typography>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 2, mb: 3 }}>
+            <TextField fullWidth label="Priority" size="small" type="number" value={form.priority}
+              onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })}
+              helperText="Higher = run first" />
+            <TextField fullWidth label="Tolerance" size="small" type="number" value={form.tolerance}
+              onChange={(e) => setForm({ ...form, tolerance: Number(e.target.value) })}
+              helperText="Acceptable diff %" />
+            <TextField fullWidth label="Timestamp Col" size="small" value={form.timestamp_column}
+              onChange={(e) => setForm({ ...form, timestamp_column: e.target.value })}
+              helperText="For incremental" />
+            <FormControlLabel
+              control={<Switch checked={form.active} onChange={(e) => setForm({ ...form, active: e.target.checked })} color="success" />}
+              label="Active"
+              sx={{ ml: 0 }}
+            />
+          </Box>
 
-            {/* Options */}
-            <Grid item xs={3}>
-              <TextField fullWidth label="Priority" size="small" type="number" value={form.priority}
-                onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })} />
-            </Grid>
-            <Grid item xs={3}>
-              <TextField fullWidth label="Tolerance" size="small" type="number" value={form.tolerance}
-                onChange={(e) => setForm({ ...form, tolerance: Number(e.target.value) })} />
-            </Grid>
-            <Grid item xs={6}>
-              <TextField fullWidth label="Ignore Columns" size="small" value={form.ignore_columns}
-                onChange={(e) => setForm({ ...form, ignore_columns: e.target.value })} />
-            </Grid>
-
-            {/* Where / Timestamp */}
-            <Grid item xs={6}>
-              <TextField fullWidth label="WHERE Clause" size="small" value={form.where_clause}
-                onChange={(e) => setForm({ ...form, where_clause: e.target.value })}
-                placeholder="status = 'ACTIVE'" />
-            </Grid>
-            <Grid item xs={3}>
-              <TextField fullWidth label="Timestamp Column" size="small" value={form.timestamp_column}
-                onChange={(e) => setForm({ ...form, timestamp_column: e.target.value })} />
-            </Grid>
-            <Grid item xs={3}>
-              <FormControlLabel
-                control={<Switch checked={form.active} onChange={(e) => setForm({ ...form, active: e.target.checked })} />}
-                label="Active"
-              />
-            </Grid>
-
-            {/* Tags & Notes */}
-            <Grid item xs={6}>
-              <TextField fullWidth label="Tags (comma-separated)" size="small" value={form.tags}
-                onChange={(e) => setForm({ ...form, tags: e.target.value })}
-                placeholder="finance, critical" />
-            </Grid>
-            <Grid item xs={6}>
-              <TextField fullWidth label="Notes" size="small" value={form.notes}
-                onChange={(e) => setForm({ ...form, notes: e.target.value })} />
-            </Grid>
-          </Grid>
+          {/* Section: Labels */}
+          <Typography variant="overline" sx={{ color: '#64748B', fontWeight: 700, letterSpacing: 1.2, display: 'block', mb: 1 }}>
+            Labels & Notes
+          </Typography>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 2 }}>
+            <TextField fullWidth label="Tags" size="small" value={form.tags}
+              onChange={(e) => setForm({ ...form, tags: e.target.value })}
+              placeholder="finance, critical" />
+            <TextField fullWidth label="Notes" size="small" value={form.notes}
+              onChange={(e) => setForm({ ...form, notes: e.target.value })}
+              placeholder="Any additional context..." />
+          </Box>
         </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2 }}>
-          <Button onClick={() => setDialogOpen(false)}>Cancel</Button>
-          <Button variant="contained" onClick={handleSave}
+        <DialogActions sx={{ px: 3, pb: 2.5, pt: 1 }}>
+          <Button onClick={() => setDialogOpen(false)} sx={{ color: '#64748B' }}>Cancel</Button>
+          <Button variant="contained" onClick={handleSave} sx={{ px: 4, borderRadius: 2 }}
             disabled={!form.source_connection || !form.source_table || !form.target_connection || !form.target_table}>
             {editEntry ? 'Update' : 'Create'}
           </Button>

@@ -763,8 +763,8 @@ class BulkImportRequest(BaseModel):
 class RunFromMetadataRequest(BaseModel):
     group_name: str = ""
     ids: list[int] = []
-    parallel: bool = False
-    max_workers: int = 4
+    parallel: bool = True
+    max_workers: int = 20
     incremental: bool = False
     fail_fast: bool = False
 
@@ -868,12 +868,15 @@ def bulk_import_metadata(req: BulkImportRequest):
 
 @app.post("/api/metadata/run")
 def run_from_metadata(req: RunFromMetadataRequest):
-    """Run validations from metadata entries (by group or specific IDs).
+    """Run validations from metadata entries in parallel using the batch engine.
 
-    This generates and executes suites from the metadata table — no YAML needed.
+    Uses connection pooling + ThreadPool for 3000+ table throughput.
+    Returns batch_id for progress polling via GET /api/metadata/run/{batch_id}.
     """
     try:
         from etl_validator.engine.intelligent import IntelligentStore
+        from etl_validator.engine.batch import execute_batch, BatchConfig
+
         store = IntelligentStore()
 
         # Get entries to run
@@ -884,166 +887,62 @@ def run_from_metadata(req: RunFromMetadataRequest):
             entries = store.get_all_metadata(group=req.group_name, active_only=True)
 
         if not entries:
+            store.close()
             raise HTTPException(status_code=404, detail="No metadata entries found")
 
         store.close()
 
-        # Execute each entry as a suite
-        batch_id = uuid.uuid4().hex[:12]
-        all_results = []
+        # Build connections map from saved connections DB
+        db = _conn_db()
+        all_conns = db.execute("SELECT * FROM connections").fetchall()
+        db.close()
 
-        for entry in entries:
-            try:
-                # Build check specs from metadata
-                check_types = [ct.strip() for ct in entry["check_types"].split(",") if ct.strip()]
-                check_specs = []
-                for ct in check_types:
-                    spec = {"type": ct, "strategy": entry.get("strategy", "auto")}
-                    if entry.get("join_keys"):
-                        spec["join_keys"] = [k.strip() for k in entry["join_keys"].split(",") if k.strip()]
-                    check_specs.append(spec)
+        connections_map = {}
+        for row in all_conns:
+            config = ConnectionConfig(
+                platform=row["platform"],
+                dsn=row["dsn"] or "",
+                host=row["host"] or "",
+                port=row["port"] or 0,
+                user=row["username"] or "",
+                password=row["password"] or "",
+                database=row["database_name"] or "",
+                schema=row["schema_name"] or "",
+                extra={"file_path": row["file_path"]} if row["file_path"] else {},
+            )
+            connections_map[row["name"]] = (row["platform"], config)
 
-                # Build the adhoc-style payload and reuse existing run logic
-                payload = {
-                    "source_connection_id": None,
-                    "source_table": entry["source_table"],
-                    "target_table": entry["target_table"],
-                    "checks": check_specs,
-                    "suite_name": f"{entry['group_name']}/{entry['source_table']}",
-                    "parallel": req.parallel,
-                    "max_workers": req.max_workers,
-                    "fail_fast": req.fail_fast,
-                    "batch_id": batch_id,
-                    "where": entry.get("where_clause", ""),
-                    "incremental": req.incremental,
-                }
+        # Configure batch execution
+        batch_config = BatchConfig(
+            max_parallel=req.max_workers,
+            max_connections_per_db=min(req.max_workers, 10),
+            incremental=req.incremental,
+            fail_fast=req.fail_fast,
+            priority_order=True,
+        )
 
-                # Resolve connections by name
-                db = _conn_db()
-                src_row = db.execute(
-                    "SELECT * FROM connections WHERE name = ?",
-                    (entry["source_connection"],),
-                ).fetchone()
-                tgt_row = db.execute(
-                    "SELECT * FROM connections WHERE name = ?",
-                    (entry["target_connection"],),
-                ).fetchone()
-                db.close()
-
-                if not src_row or not tgt_row:
-                    all_results.append({
-                        "table": entry["source_table"],
-                        "status": "Error",
-                        "message": f"Connection not found: src={entry['source_connection']}, tgt={entry['target_connection']}",
-                    })
-                    continue
-
-                # Build connection configs
-                src_config = ConnectionConfig(
-                    platform=src_row["platform"],
-                    dsn=src_row["dsn"] or "",
-                    host=src_row["host"] or "",
-                    port=src_row["port"] or 0,
-                    user=src_row["username"] or "",
-                    password=src_row["password"] or "",
-                    database=src_row["database_name"] or "",
-                    schema=src_row["schema_name"] or "",
-                    extra={"file_path": src_row["file_path"]} if src_row["file_path"] else {},
-                )
-                tgt_config = ConnectionConfig(
-                    platform=tgt_row["platform"],
-                    dsn=tgt_row["dsn"] or "",
-                    host=tgt_row["host"] or "",
-                    port=tgt_row["port"] or 0,
-                    user=tgt_row["username"] or "",
-                    password=tgt_row["password"] or "",
-                    database=tgt_row["database_name"] or "",
-                    schema=tgt_row["schema_name"] or "",
-                    extra={"file_path": tgt_row["file_path"]} if tgt_row["file_path"] else {},
-                )
-
-                # Build and execute suite
-                from etl_validator.checks.base import CheckConfig
-                from etl_validator.engine.executor import execute_suite
-                from etl_validator.engine.suite_loader import TestSuite
-
-                checks = []
-                for spec in check_specs:
-                    cc = CheckConfig(
-                        check_type=spec["type"],
-                        source_table=entry["source_table"],
-                        target_table=entry["target_table"],
-                        join_keys=spec.get("join_keys", []),
-                        ignore_columns=[c.strip() for c in entry.get("ignore_columns", "").split(",") if c.strip()],
-                        where=entry.get("where_clause", ""),
-                        tolerance=entry.get("tolerance", 0),
-                        extra={"strategy": spec.get("strategy", "auto")},
-                    )
-                    checks.append(cc)
-
-                suite = TestSuite(
-                    name=f"{entry['group_name']}/{entry['source_table']}",
-                    source=src_config,
-                    target=tgt_config,
-                    source_platform=src_row["platform"],
-                    target_platform=tgt_row["platform"],
-                    checks=checks,
-                )
-
-                result = execute_suite(
-                    suite,
-                    parallel=req.parallel,
-                    max_workers=req.max_workers,
-                    fail_fast=req.fail_fast,
-                    incremental=req.incremental,
-                    timestamp_column=entry.get("timestamp_column", "DL_UPDATE_TS"),
-                )
-
-                # Store results
-                rs = ResultStore()
-                rs.record_suite(result, batch_id=batch_id,
-                                source=entry["source_table"],
-                                target=entry["target_table"])
-                rs.close()
-
-                all_results.append({
-                    "table": entry["source_table"],
-                    "status": str(result.overall_status),
-                    "quality_score": result.quality_score,
-                    "checks": len(result.results),
-                    "passed": result.passed,
-                    "failed": result.failed,
-                    "duration_s": round(result.duration_seconds, 2),
-                })
-
-            except Exception as e:
-                log.exception("Metadata run failed for %s", entry.get("source_table", "?"))
-                all_results.append({
-                    "table": entry.get("source_table", "?"),
-                    "status": "Error",
-                    "message": str(e),
-                })
-
-        # Summary
-        total = len(all_results)
-        passed = sum(1 for r in all_results if r.get("status") == "Pass")
-        failed = sum(1 for r in all_results if r.get("status") == "Fail")
-        errors = sum(1 for r in all_results if r.get("status") == "Error")
-
-        return {
-            "batch_id": batch_id,
-            "total": total,
-            "passed": passed,
-            "failed": failed,
-            "errors": errors,
-            "results": all_results,
-        }
+        # Execute batch in parallel
+        result = execute_batch(entries, connections_map, batch_config)
+        return result
 
     except HTTPException:
         raise
     except Exception as e:
         log.exception("run_from_metadata failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/metadata/run/{batch_id}")
+def get_run_progress(batch_id: str):
+    """Poll real-time progress of an active batch run."""
+    from etl_validator.engine.batch import get_batch_progress, get_batch_details
+    progress = get_batch_progress(batch_id)
+    if not progress:
+        raise HTTPException(status_code=404, detail="Batch not found or already completed")
+    return {
+        "progress": progress,
+        "details": get_batch_details(batch_id),
+    }
 
 
 
