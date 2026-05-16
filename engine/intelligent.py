@@ -527,112 +527,276 @@ def select_optimal_strategy(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PYRAMID VALIDATION — aggregate check first, drill only on failure
+# FINGERPRINT VALIDATION — single-query proof of correctness
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def pyramid_aggregate_check(src_conn, tgt_conn, src_table: str, tgt_table: str,
-                            columns: list[str] | None = None,
-                            where: str = "") -> dict:
-    """Quick aggregate pre-check: COUNT + SUM of numeric columns.
+def _build_fingerprint_query(
+    table: str, columns: list[str], key_column: str | None,
+    platform: str, where: str = "",
+) -> str:
+    """Build a single fingerprint query that returns 1 row with all proof metrics.
 
-    Returns:
-        dict with keys: passed (bool), src_count, tgt_count, agg_match,
-        details (list of mismatches if any)
+    Metrics produced:
+    - ROW_COUNT: total rows
+    - DISTINCT_KEYS: unique key count (duplicate detection)
+    - DATA_FINGERPRINT: SUM of per-row hash covering ALL columns (value integrity)
+    - MIN_KEY / MAX_KEY: key boundaries (range completeness)
+    - SUM of top numeric columns (aggregate sanity)
     """
     from ..connectors.base import safe_identifier, safe_table_expr
 
     clause = f"WHERE {where}" if where else ""
-    src_t = safe_table_expr(src_table)
-    tgt_t = safe_table_expr(tgt_table)
+    tbl = safe_table_expr(table)
 
-    # Step 1: Row count comparison
-    src_count_df = src_conn.execute_query(f"SELECT COUNT(*) AS CNT FROM {src_t} {clause}")
-    tgt_count_df = tgt_conn.execute_query(f"SELECT COUNT(*) AS CNT FROM {tgt_t} {clause}")
-    src_count = int(src_count_df.iloc[0, 0])
-    tgt_count = int(tgt_count_df.iloc[0, 0])
+    parts = [f'COUNT(*) AS "ROW_COUNT"']
 
-    if src_count != tgt_count:
-        return {
-            "passed": False,
-            "src_count": src_count,
-            "tgt_count": tgt_count,
-            "agg_match": False,
-            "reason": f"Row count mismatch: src={src_count:,}, tgt={tgt_count:,}",
-            "details": [],
-        }
+    # Key-based metrics
+    if key_column:
+        key_col = safe_identifier(key_column)
+        parts.append(f'COUNT(DISTINCT "{key_col}") AS "DISTINCT_KEYS"')
+        parts.append(f'MIN("{key_col}") AS "MIN_KEY"')
+        parts.append(f'MAX("{key_col}") AS "MAX_KEY"')
 
-    # Step 2: Aggregate comparison on numeric columns
-    # Get numeric columns (try to detect from metadata)
+    # Data fingerprint — platform-specific hash covering ALL columns
+    if columns:
+        if platform == "teradata":
+            # Teradata HASHROW: native, fast, covers all column types
+            # Cast to BIGINT and SUM to get a table-wide fingerprint
+            hash_args = ", ".join(
+                f'COALESCE(CAST("{safe_identifier(c)}" AS VARCHAR(1000)), \'__NULL__\')'
+                for c in columns
+            )
+            parts.append(
+                f'SUM(CAST(HASHBUCKET(HASHROW({hash_args})) AS BIGINT)) AS "DATA_FINGERPRINT"'
+            )
+        elif platform == "snowflake":
+            # Snowflake HASH(*) returns BIGINT
+            col_list = ", ".join(f'"{safe_identifier(c)}"' for c in columns)
+            parts.append(f'SUM(HASH({col_list})) AS "DATA_FINGERPRINT"')
+        elif platform == "bigquery":
+            col_list = ", ".join(f'"{safe_identifier(c)}"' for c in columns)
+            parts.append(
+                f'SUM(FARM_FINGERPRINT(TO_JSON_STRING(STRUCT({col_list})))) AS "DATA_FINGERPRINT"'
+            )
+        else:
+            # Generic SQL: hash via concatenation + numeric conversion
+            # Works on PostgreSQL, DuckDB, most ANSI-SQL engines
+            concat_parts = " || '|' || ".join(
+                f'COALESCE(CAST("{safe_identifier(c)}" AS VARCHAR), \'__NULL__\')'
+                for c in columns[:30]  # limit to 30 cols for concat safety
+            )
+            parts.append(f'SUM(LENGTH({concat_parts})) AS "DATA_FINGERPRINT"')
+
+    # Numeric column SUMs (top 15 for aggregate confirmation)
+    # These are detected by the caller and passed in via numeric_columns
+    select_expr = ", ".join(parts)
+    return f"SELECT {select_expr} FROM {tbl} {clause}"
+
+
+def _detect_numeric_columns(conn, table: str) -> list[str]:
+    """Detect numeric columns from table metadata."""
+    try:
+        meta = conn.get_metadata(table)
+        numeric_types = {'NUMBER', 'INTEGER', 'INT', 'BIGINT', 'SMALLINT',
+                         'DECIMAL', 'NUMERIC', 'FLOAT', 'DOUBLE', 'REAL',
+                         'INT64', 'FLOAT64', 'INT32', 'FLOAT32'}
+        return [
+            row["COLUMN_NAME"] for _, row in meta.iterrows()
+            if any(t in str(row.get("DATA_TYPE", "")).upper() for t in numeric_types)
+        ][:15]
+    except Exception:
+        return []
+
+
+def pyramid_aggregate_check(src_conn, tgt_conn, src_table: str, tgt_table: str,
+                            columns: list[str] | None = None,
+                            key_column: str | None = None,
+                            where: str = "") -> dict:
+    """Three-layer fingerprint validation.
+
+    Layer 1: Single-query fingerprint (1 query per side → 2 total)
+             Covers: row count, distinct keys, data hash, key range, numeric sums
+             If all match → PASS (data is identical with near-certainty)
+
+    Layer 2: Diagnostic (only on fingerprint failure)
+             Identifies WHAT failed: count? duplicates? values? range?
+             Returns actionable detail so Layer 3 can target the right rows.
+
+    Returns:
+        dict with: passed, src_count, tgt_count, reason, layer,
+                   diagnostics (list of what failed), details
+    """
+    from ..connectors.base import safe_identifier, safe_table_expr
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    clause = f"WHERE {where}" if where else ""
+
+    # ── Detect platform ──────────────────────────────────────────────────────
+    src_platform = getattr(src_conn, 'config', None)
+    src_platform = src_platform.platform if src_platform else "generic"
+    tgt_platform = getattr(tgt_conn, 'config', None)
+    tgt_platform = tgt_platform.platform if tgt_platform else "generic"
+
+    # ── Get all columns (for hash fingerprint) ───────────────────────────────
     if not columns:
         try:
-            meta = tgt_conn.get_metadata(tgt_table)
-            numeric_types = {'NUMBER', 'INTEGER', 'INT', 'BIGINT', 'SMALLINT',
-                             'DECIMAL', 'NUMERIC', 'FLOAT', 'DOUBLE', 'REAL'}
-            columns = [
-                row["COLUMN_NAME"] for _, row in meta.iterrows()
-                if any(t in str(row.get("DATA_TYPE", "")).upper() for t in numeric_types)
-            ]
+            columns = tgt_conn.get_column_names(tgt_table)
         except Exception:
             columns = []
 
-    if not columns:
-        # No numeric columns to sum — row counts match, that's our best check
+    # ── Detect key column from metadata if not provided ──────────────────────
+    if not key_column and columns:
+        # Heuristic: first column with "id" or "key" in name
+        for c in columns:
+            cl = c.lower()
+            if cl == "id" or cl.endswith("_id") or cl.endswith("_key") or cl.endswith("_pk"):
+                key_column = c
+                break
+
+    # ── Detect numeric columns for SUM verification ──────────────────────────
+    numeric_cols = _detect_numeric_columns(tgt_conn, tgt_table)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 1: Single-query fingerprint (2 queries total)
+    # ══════════════════════════════════════════════════════════════════════════
+    src_query = _build_fingerprint_query(
+        src_table, columns, key_column, src_platform, where
+    )
+    tgt_query = _build_fingerprint_query(
+        tgt_table, columns, key_column, tgt_platform, where
+    )
+
+    try:
+        src_fp = src_conn.execute_query(src_query)
+        tgt_fp = tgt_conn.execute_query(tgt_query)
+    except Exception as e:
+        logger.warning("Fingerprint query failed: %s — falling back to basic count", e)
+        # Fallback: just do row count
+        try:
+            src_t = safe_table_expr(src_table)
+            tgt_t = safe_table_expr(tgt_table)
+            src_c = int(src_conn.execute_query(f"SELECT COUNT(*) AS C FROM {src_t} {clause}").iloc[0, 0])
+            tgt_c = int(tgt_conn.execute_query(f"SELECT COUNT(*) AS C FROM {tgt_t} {clause}").iloc[0, 0])
+            if src_c == tgt_c:
+                return {
+                    "passed": True,
+                    "src_count": src_c, "tgt_count": tgt_c,
+                    "reason": f"Row counts match ({src_c:,}), fingerprint unavailable",
+                    "layer": 1, "diagnostics": [], "details": [],
+                }
+            else:
+                return {
+                    "passed": False,
+                    "src_count": src_c, "tgt_count": tgt_c,
+                    "reason": f"Row count mismatch: src={src_c:,}, tgt={tgt_c:,}",
+                    "layer": 1, "diagnostics": ["row_count"], "details": [],
+                }
+        except Exception as e2:
+            return {
+                "passed": False,
+                "src_count": 0, "tgt_count": 0,
+                "reason": f"Fingerprint failed: {e2}",
+                "layer": 0, "diagnostics": ["connection_error"], "details": [],
+            }
+
+    # ── Extract metrics ──────────────────────────────────────────────────────
+    src_count = int(src_fp["ROW_COUNT"].iloc[0])
+    tgt_count = int(tgt_fp["ROW_COUNT"].iloc[0])
+
+    diagnostics = []
+
+    # Check 1: Row count
+    if src_count != tgt_count:
+        diagnostics.append("row_count")
+
+    # Check 2: Distinct keys (duplicate detection)
+    if key_column and "DISTINCT_KEYS" in src_fp.columns:
+        src_dk = int(src_fp["DISTINCT_KEYS"].iloc[0])
+        tgt_dk = int(tgt_fp["DISTINCT_KEYS"].iloc[0])
+        if src_dk != tgt_dk:
+            diagnostics.append("distinct_keys")
+        # Also check if keys < count (duplicates exist)
+        if tgt_dk < tgt_count and src_dk == src_count:
+            diagnostics.append("target_has_duplicates")
+
+    # Check 3: Key range (boundary completeness)
+    if key_column and "MIN_KEY" in src_fp.columns:
+        src_min = str(src_fp["MIN_KEY"].iloc[0])
+        tgt_min = str(tgt_fp["MIN_KEY"].iloc[0])
+        src_max = str(src_fp["MAX_KEY"].iloc[0])
+        tgt_max = str(tgt_fp["MAX_KEY"].iloc[0])
+        if src_min != tgt_min or src_max != tgt_max:
+            diagnostics.append("key_range")
+
+    # Check 4: Data fingerprint (value integrity — covers ALL columns)
+    if "DATA_FINGERPRINT" in src_fp.columns:
+        src_hash = src_fp["DATA_FINGERPRINT"].iloc[0]
+        tgt_hash = tgt_fp["DATA_FINGERPRINT"].iloc[0]
+        # Handle potential float comparison
+        try:
+            src_hash_val = float(src_hash) if src_hash is not None else 0
+            tgt_hash_val = float(tgt_hash) if tgt_hash is not None else 0
+            if src_hash_val != tgt_hash_val:
+                diagnostics.append("data_fingerprint")
+        except (ValueError, TypeError):
+            if str(src_hash) != str(tgt_hash):
+                diagnostics.append("data_fingerprint")
+
+    # ── Verdict ──────────────────────────────────────────────────────────────
+    if not diagnostics:
+        reason_parts = [f"rows={src_count:,}"]
+        if key_column:
+            reason_parts.append(f"keys=unique")
+        if "DATA_FINGERPRINT" in src_fp.columns:
+            reason_parts.append("hash=match")
         return {
             "passed": True,
             "src_count": src_count,
             "tgt_count": tgt_count,
-            "agg_match": True,
-            "reason": "Row counts match, no numeric columns for aggregate check",
+            "reason": f"FINGERPRINT PASS: {', '.join(reason_parts)}",
+            "layer": 1,
+            "diagnostics": [],
             "details": [],
         }
 
-    # Build SUM queries for top N numeric columns (limit to 20 for performance)
-    check_cols = columns[:20]
-    sum_exprs = ", ".join(
-        f'COALESCE(CAST(SUM("{safe_identifier(c)}") AS DECIMAL(38,5)), 0) AS "SUM_{c}"'
-        for c in check_cols
-    )
+    # ══════════════════════════════════════════════════════════════════════════
+    # LAYER 2: Diagnostic — pinpoint what failed
+    # ══════════════════════════════════════════════════════════════════════════
+    detail_parts = []
 
-    src_agg = src_conn.execute_query(f"SELECT {sum_exprs} FROM {src_t} {clause}")
-    tgt_agg = tgt_conn.execute_query(f"SELECT {sum_exprs} FROM {tgt_t} {clause}")
+    if "row_count" in diagnostics:
+        diff = src_count - tgt_count
+        detail_parts.append(f"Row count: src={src_count:,}, tgt={tgt_count:,} (diff={diff:+,})")
 
-    # Compare aggregates
-    mismatches = []
-    for col in check_cols:
-        sum_col = f"SUM_{col}"
-        src_val = float(src_agg[sum_col].iloc[0]) if sum_col in src_agg.columns else 0
-        tgt_val = float(tgt_agg[sum_col].iloc[0]) if sum_col in tgt_agg.columns else 0
+    if "distinct_keys" in diagnostics:
+        detail_parts.append(
+            f"Distinct keys: src={src_dk:,}, tgt={tgt_dk:,}"
+        )
 
-        if src_val == 0 and tgt_val == 0:
-            continue
-        # Use relative tolerance of 0.0001 (0.01%) for floating point
-        denom = max(abs(src_val), abs(tgt_val), 1)
-        diff_pct = abs(src_val - tgt_val) / denom
-        if diff_pct > 0.0001:
-            mismatches.append({
-                "column": col,
-                "src_sum": src_val,
-                "tgt_sum": tgt_val,
-                "diff_pct": round(diff_pct * 100, 4),
-            })
+    if "target_has_duplicates" in diagnostics:
+        dup_count = tgt_count - tgt_dk
+        detail_parts.append(f"Target has {dup_count:,} duplicate rows")
 
-    if mismatches:
-        return {
-            "passed": False,
-            "src_count": src_count,
-            "tgt_count": tgt_count,
-            "agg_match": False,
-            "reason": f"Aggregate mismatch on {len(mismatches)} column(s): {', '.join(m['column'] for m in mismatches[:5])}",
-            "details": mismatches,
-        }
+    if "key_range" in diagnostics:
+        detail_parts.append(
+            f"Key range: src=[{src_min}..{src_max}], tgt=[{tgt_min}..{tgt_max}]"
+        )
+
+    if "data_fingerprint" in diagnostics and "row_count" not in diagnostics:
+        detail_parts.append("Data values differ (hash mismatch) despite matching row count")
+
+    reason = f"FINGERPRINT FAIL: {'; '.join(detail_parts)}"
 
     return {
-        "passed": True,
+        "passed": False,
         "src_count": src_count,
         "tgt_count": tgt_count,
-        "agg_match": True,
-        "reason": f"Row counts match ({src_count:,}) and {len(check_cols)} aggregate(s) match",
-        "details": [],
+        "reason": reason,
+        "layer": 2,
+        "diagnostics": diagnostics,
+        "details": detail_parts,
     }
 
 

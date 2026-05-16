@@ -723,7 +723,7 @@ class MetadataEntry(BaseModel):
     target_connection: str
     target_table: str
     join_keys: str = ""
-    check_types: str = "row_count,data"
+    check_types: str = "data"
     strategy: str = "auto"
     priority: float = 50.0
     tolerance: float = 0.0

@@ -27,7 +27,7 @@ const EMPTY_ENTRY = {
   target_connection: '',
   target_table: '',
   join_keys: '',
-  check_types: 'row_count,data',
+  check_types: 'data',
   strategy: 'auto',
   priority: 50,
   tolerance: 0,
@@ -518,7 +518,7 @@ export default function MetadataManager() {
               helperText="Comma-separated primary/join keys" />
             <TextField fullWidth label="Check Types" size="small" value={form.check_types}
               onChange={(e) => setForm({ ...form, check_types: e.target.value })}
-              placeholder="row_count, data, schema"
+              placeholder="data"
               helperText="Comma-separated check types to run" />
             <TextField fullWidth label="WHERE Clause" size="small" value={form.where_clause}
               onChange={(e) => setForm({ ...form, where_clause: e.target.value })}

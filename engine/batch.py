@@ -282,7 +282,7 @@ def _validate_single_table(
         tgt_conn = pool.acquire(tgt_platform, tgt_config)
 
         # Build checks from metadata
-        check_types = [ct.strip() for ct in entry.get("check_types", "row_count").split(",") if ct.strip()]
+        check_types = [ct.strip() for ct in entry.get("check_types", "data").split(",") if ct.strip()]
         join_keys = [k.strip() for k in entry.get("join_keys", "").split(",") if k.strip()]
         ignore_cols = [c.strip() for c in entry.get("ignore_columns", "").split(",") if c.strip()]
 

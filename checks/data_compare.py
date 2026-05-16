@@ -341,13 +341,16 @@ class DataCheck(BaseCheck):
         if use_pyramid and not config.extra.get("_pyramid_done"):
             try:
                 from ..engine.intelligent import pyramid_aggregate_check
+                # Pass key column for distinct-key and range checks
+                key_col = config.join_keys[0] if config.join_keys and config.join_keys != ["NA"] else None
                 pyramid_result = pyramid_aggregate_check(
                     src_conn, tgt_conn,
                     config.source_table, config.target_table,
+                    key_column=key_col,
                     where=config.where,
                 )
                 if pyramid_result["passed"]:
-                    logger.info("PYRAMID PASS: %s — skipping detailed comparison",
+                    logger.info("FINGERPRINT PASS: %s — skipping detailed comparison",
                                 pyramid_result["reason"])
                     return CheckResult(
                         check_type=self.name,
@@ -359,17 +362,18 @@ class DataCheck(BaseCheck):
                             "rows_only_in_source": 0,
                             "rows_only_in_target": 0,
                             "rows_with_diffs": 0,
-                            "comparison_mode": "pyramid",
-                            "join_keys_used": "N/A (aggregate match)",
-                            "strategy": "pyramid",
+                            "comparison_mode": "fingerprint",
+                            "join_keys_used": key_col or "auto-detected",
+                            "strategy": "fingerprint",
+                            "layer": pyramid_result.get("layer", 1),
                         },
-                        message=f"PYRAMID PASS: {pyramid_result['reason']}",
+                        message=f"FINGERPRINT PASS: {pyramid_result['reason']}",
                     )
                 else:
-                    logger.info("PYRAMID FAIL: %s — drilling into detailed comparison",
-                                pyramid_result["reason"])
+                    logger.info("FINGERPRINT FAIL: %s — drilling into detailed comparison (diagnostics: %s)",
+                                pyramid_result["reason"], pyramid_result.get("diagnostics", []))
             except Exception as e:
-                logger.debug("Pyramid pre-check failed (non-fatal): %s", e)
+                logger.debug("Fingerprint pre-check failed (non-fatal): %s", e)
 
         # ── Adaptive Strategy Selection ──────────────────────────────────────
         strategy = config.extra.get("strategy", "auto")
