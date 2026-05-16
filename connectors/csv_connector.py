@@ -1,18 +1,12 @@
 """CSV file connector — treats a CSV file like a table."""
 
 import logging
-import re
 
 import pandas as pd
 
 from .base import BaseConnector, ConnectionConfig
 
 logger = logging.getLogger(__name__)
-
-# Allowed operators for safe WHERE filtering on CSV DataFrames
-_SAFE_WHERE_PATTERN = re.compile(
-    r'^[\w\s\.\,\'\"\=\!\<\>\&\|\(\)\-\+]+$'
-)
 
 
 class CSVConnector(BaseConnector):

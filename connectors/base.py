@@ -126,11 +126,6 @@ class BaseConnector(ABC):
         except Exception:
             return False
 
-    def reconnect(self):
-        """Close and reopen the connection."""
-        self.close()
-        self.connect()
-
     # ── query helpers ──
     @abstractmethod
     def execute_query(self, query: str, params: dict | None = None) -> pd.DataFrame:

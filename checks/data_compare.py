@@ -15,7 +15,6 @@ Advanced features:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 
 import pandas as pd

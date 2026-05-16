@@ -12,10 +12,7 @@ import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
 import WarningAmberRoundedIcon from '@mui/icons-material/WarningAmberRounded';
 import PictureAsPdfRoundedIcon from '@mui/icons-material/PictureAsPdfRounded';
 import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded';
-import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined';
 import TimerRoundedIcon from '@mui/icons-material/TimerRounded';
-import DataObjectRoundedIcon from '@mui/icons-material/DataObjectRounded';
-import ScheduleRoundedIcon from '@mui/icons-material/ScheduleRounded';
 import { useNavigate, useParams } from 'react-router-dom';
 import { getRunResult } from '../api';
 
@@ -58,17 +55,6 @@ const COL_HEADERS = {
 };
 const fmtCol = (c) => COL_HEADERS[c] || c;
 
-/* ── Check type descriptions for business users ──────────── */
-const CHECK_DESC = {
-  row_count: 'Compares the number of rows between source and target tables',
-  metadata: 'Compares column names, data types, and nullable settings',
-  null_check: 'Compares null value counts per column between source and target',
-  data: 'Row-by-row and cell-by-cell comparison of actual data values',
-  duplicate: 'Checks for duplicate rows in source and target',
-};
-
-
-
 /* ── Severity inference from check metrics ──────────────── */
 const SEVERITY = {
   critical: { label: 'Critical', color: '#DC2626', bg: '#FEF2F2', icon: '🔴' },
@@ -98,30 +84,6 @@ function inferSeverity(check) {
     return SEVERITY.medium;
   }
   return SEVERITY.medium;
-}
-
-/* ── Actionable recommendations per check type ───────────── */
-function getRecommendation(check) {
-  if (check.status === 'Pass') return null;
-  const m = check.metrics || {};
-  switch (check.check_type) {
-    case 'data':
-      if (m.match_pct != null && m.match_pct <= 50) return 'Very low match rate — verify key cols are correct and data was loaded from the same snapshot.';
-      if (m.mismatch_columns) return `Focus investigation on columns: ${m.mismatch_columns}. Check for transformation logic or encoding differences.`;
-      return 'Review the diff table below. Filter by column to identify systematic patterns.';
-    case 'row_count':
-      if (m.row_count_diff > 0) return 'Target has fewer rows than source — check for failed inserts, filtering logic, or incomplete loads.';
-      if (m.row_count_diff < 0) return 'Target has more rows — check for duplicate inserts or missing deduplication logic.';
-      return 'Row counts diverged — verify the ETL load completed successfully.';
-    case 'metadata':
-      return 'Metadata mismatch detected — review column type changes. This may indicate an upstream schema migration.';
-    case 'null_check':
-      return 'Null count mismatch — check for coalesce/default-value logic differences or missing NOT NULL constraints.';
-    case 'duplicate':
-      return 'Duplicates found — verify primary key constraints and deduplication steps in the pipeline.';
-    default:
-      return 'Review the details below to understand the failure.';
-  }
 }
 
 /* ── Natural language summary generator ──────────────────── */
@@ -832,20 +794,6 @@ export default function ResultDetail({ result: propResult }) {
       navigator.clipboard.writeText(window.location.origin + '/results/' + rid);
       setCopied(true);
     }
-  }, [propResult, fetchedResult]);
-
-  const exportJson = useCallback(() => {
-    const data = propResult || fetchedResult;
-    if (!data) return;
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${data.suite_name || 'validation'}_${data.run_id?.slice(0, 8) || 'report'}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   }, [propResult, fetchedResult]);
 
   useEffect(() => {

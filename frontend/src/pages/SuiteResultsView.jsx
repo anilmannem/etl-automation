@@ -1,7 +1,7 @@
 import { useState, useMemo, useCallback } from 'react';
 import {
   Box, Typography, Chip, IconButton, Collapse,
-  Button, Tooltip, Snackbar, LinearProgress,
+  Button, Tooltip, Snackbar,
 } from '@mui/material';
 import ArrowBackRoundedIcon from '@mui/icons-material/ArrowBackRounded';
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
@@ -10,7 +10,6 @@ import ErrorOutlineRoundedIcon from '@mui/icons-material/ErrorOutlineRounded';
 import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
 import DataObjectRoundedIcon from '@mui/icons-material/DataObjectRounded';
 import ContentCopyRoundedIcon from '@mui/icons-material/ContentCopyRounded';
-import StorageRoundedIcon from '@mui/icons-material/StorageRounded';
 import CompareArrowsRoundedIcon from '@mui/icons-material/CompareArrowsRounded';
 import TimerRoundedIcon from '@mui/icons-material/TimerRounded';
 import { useNavigate } from 'react-router-dom';

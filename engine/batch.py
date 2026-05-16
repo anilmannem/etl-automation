@@ -19,8 +19,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any
-
 from ..checks.base import CheckConfig, CheckResult, Status
 from ..checks.registry import get_check
 from ..connectors.base import BaseConnector, ConnectionConfig

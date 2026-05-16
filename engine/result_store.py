@@ -142,43 +142,5 @@ class ResultStore:
         rows = [dict(zip(cols, r)) for r in cursor.fetchall()]
         return rows if rows else None
 
-    def get_trend(self, suite: str, check_type: str | None = None,
-                  days: int = 30) -> pd.DataFrame:
-        """Get pass/fail trend over time."""
-        query = """
-            SELECT date(timestamp) AS day,
-                   check_type,
-                   status,
-                   COUNT(*) AS cnt
-            FROM test_results
-            WHERE suite = ? AND timestamp > datetime('now', ?)
-        """
-        params: list = [suite, f"-{days} days"]
-        if check_type:
-            query += " AND check_type = ?"
-            params.append(check_type)
-        query += " GROUP BY day, check_type, status ORDER BY day"
-        return pd.read_sql_query(query, self._conn, params=params)
-
-    def get_metric_trend(self, suite: str, metric_key: str,
-                         days: int = 30) -> pd.DataFrame:
-        """Extract a specific metric value over time (e.g. row_count_diff)."""
-        df = self.get_history(suite, days)
-        if df.empty:
-            return pd.DataFrame(columns=["timestamp", metric_key])
-        rows = []
-        for _, row in df.iterrows():
-            try:
-                metrics = json.loads(row["metrics_json"]) if row["metrics_json"] else {}
-            except (json.JSONDecodeError, TypeError):
-                metrics = {}
-            if metric_key in metrics:
-                rows.append({
-                    "timestamp": row["timestamp"],
-                    "check_type": row["check_type"],
-                    metric_key: metrics[metric_key],
-                })
-        return pd.DataFrame(rows)
-
     def close(self):
         self._conn.close()

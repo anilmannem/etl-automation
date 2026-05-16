@@ -113,11 +113,6 @@ class AdhocRequest(BaseModel):
     timestamp_column: str = "DL_UPDATE_TS"
 
 
-class HistoryQuery(BaseModel):
-    suite: str = ""
-    days: int = 30
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _suite_result_to_dict(result: SuiteResult) -> dict:

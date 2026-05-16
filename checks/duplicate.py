@@ -14,7 +14,7 @@ import logging
 import pandas as pd
 
 from .base import BaseCheck, CheckConfig, CheckResult, Status
-from ..connectors.base import safe_identifier, safe_identifiers, quote_identifier
+from ..connectors.base import safe_identifier, quote_identifier
 
 logger = logging.getLogger(__name__)
 

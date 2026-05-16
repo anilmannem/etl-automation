@@ -16,8 +16,6 @@ from .base import BaseCheck, CheckConfig, CheckResult, Status
 
 logger = logging.getLogger(__name__)
 
-# Default values treated as semantically null (beyond SQL NULL)
-DEFAULT_MISSING_VALUES = {"", "NULL", "N/A", "NA", "NONE", "-", ".", "NAN"}
 
 
 class NullCheck(BaseCheck):

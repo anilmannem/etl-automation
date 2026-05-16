@@ -94,7 +94,6 @@ def run(suite_path, connections, output, output_path, fail_on, store, parallel, 
         click.echo(f"HTML report: {path}")
 
     if output == "json":
-        import json
         data = result.summary_dict()
         data["checks"] = [r.to_dict() for r in result.results]
         click.echo(json.dumps(data, indent=2, default=str))

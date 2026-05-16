@@ -131,28 +131,6 @@ class TeradataConnector(BaseConnector):
         )
         return df.iloc[0, 0]
 
-    def build_row_hash_query(
-        self, table: str, columns: list[str], where: str = "",
-        key_columns: list[str] | None = None,
-    ) -> str:
-        """Build a Teradata-native HASHROW() query for server-side row hashing.
-
-        Uses Teradata HASHROW() which is faster than MD5(CONCAT(…)) and
-        natively supported. Falls back to MD5 if needed.
-        """
-        safe_cols = safe_identifiers(columns)
-        # HASHROW on Teradata — returns a BYTE(4), cast to INT for easy comparison
-        hash_args = ", ".join(f'COALESCE(CAST("{c}" AS VARCHAR(1000)), \'NULL\')' for c in safe_cols)
-        hash_expr = f"HASHROW({hash_args}) AS ROW_HASH"
-
-        select_parts = [hash_expr]
-        if key_columns:
-            for k in safe_identifiers(key_columns):
-                select_parts.insert(0, f'"{k}"')
-
-        clause = f"WHERE {where}" if where else ""
-        return f"SELECT {', '.join(select_parts)} FROM {safe_table_expr(table)} {clause}"
-
     def execute_streaming(
         self, query: str, chunk_size: int = 50_000
     ) -> "Generator[pd.DataFrame, None, None]":
