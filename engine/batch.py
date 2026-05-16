@@ -277,9 +277,22 @@ def _validate_single_table(
     src_conn = None
     tgt_conn = None
     try:
-        # Acquire pooled connections
-        src_conn = pool.acquire(src_platform, src_config)
-        tgt_conn = pool.acquire(tgt_platform, tgt_config)
+        # For CSV connectors, override file_path per entry (table = file path)
+        if src_platform == "csv":
+            from dataclasses import replace as dc_replace
+            src_cfg = dc_replace(src_config, extra={**src_config.extra, "file_path": entry["source_table"]})
+            src_conn = get_connector(src_platform, src_cfg)
+            src_conn.connect()
+        else:
+            src_conn = pool.acquire(src_platform, src_config)
+
+        if tgt_platform == "csv":
+            from dataclasses import replace as dc_replace
+            tgt_cfg = dc_replace(tgt_config, extra={**tgt_config.extra, "file_path": entry["target_table"]})
+            tgt_conn = get_connector(tgt_platform, tgt_cfg)
+            tgt_conn.connect()
+        else:
+            tgt_conn = pool.acquire(tgt_platform, tgt_config)
 
         # Build checks from metadata
         check_types = [ct.strip() for ct in entry.get("check_types", "data").split(",") if ct.strip()]
@@ -372,11 +385,17 @@ def _validate_single_table(
             "checks_total": 0,
         }
     finally:
-        # Return connections to pool
+        # Return connections to pool (or close CSV instances)
         if src_conn:
-            pool.release(src_platform, src_config, src_conn)
+            if src_platform == "csv":
+                src_conn.close()
+            else:
+                pool.release(src_platform, src_config, src_conn)
         if tgt_conn:
-            pool.release(tgt_platform, tgt_config, tgt_conn)
+            if tgt_platform == "csv":
+                tgt_conn.close()
+            else:
+                pool.release(tgt_platform, tgt_config, tgt_conn)
 
 
 # ── Main batch executor ──────────────────────────────────────────────────────
@@ -420,17 +439,29 @@ def execute_batch(
 
     # Filter only entries with valid connections
     valid_entries = []
+    skipped_entries = []
     for entry in entries:
         src_name = entry.get("source_connection", "")
         tgt_name = entry.get("target_connection", "")
         if src_name in connections_map and tgt_name in connections_map:
             valid_entries.append(entry)
         else:
+            skipped_entries.append(entry)
             logger.warning("Skipping %s: connection not found (src=%s, tgt=%s)",
                            entry.get("source_table"), src_name, tgt_name)
 
+    # Mark skipped entries in tracker (so progress shows 100% when done)
+    with _batches_lock:
+        tracker = _active_batches.get(batch_id)
+    if tracker:
+        for entry in skipped_entries:
+            table = entry.get("source_table", "?")
+            tracker.mark_running(table)
+            tracker.mark_done(table, "error",
+                              message=f"Connection not found: {entry.get('source_connection')} or {entry.get('target_connection')}")
+
     if not valid_entries:
-        return {"batch_id": batch_id, "error": "No valid entries to execute"}
+        return {"batch_id": batch_id, "error": "No valid entries — connections not found"}
 
     # Initialize pool; reuse existing tracker if pre-registered, else create new
     pool = ConnectionPool(max_per_key=config.max_connections_per_db)

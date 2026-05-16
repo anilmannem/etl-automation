@@ -10,8 +10,8 @@ const WIDTH = 64;
 const NAV = [
   { label: 'Dashboard', icon: DashboardRoundedIcon, path: '/' },
   { label: 'Test Suite', icon: PlayCircleFilledRoundedIcon, path: '/suite' },
-  { label: 'Connections', icon: CableRoundedIcon, path: '/connections' },
   { label: 'Validations', icon: TableChartRoundedIcon, path: '/metadata' },
+  { label: 'Connections', icon: CableRoundedIcon, path: '/connections' },
 ];
 
 const NAVY_HOVER = '#525B7E';
