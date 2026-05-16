@@ -26,6 +26,9 @@ Thumbs.db
 # Database
 *.db
 
+# Test data
+test_data/
+
 # Uploads
 uploads/
 

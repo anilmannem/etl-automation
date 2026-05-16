@@ -3,13 +3,16 @@ import {
   Box, Typography, Button, TextField, Select, MenuItem,
   FormControl, InputLabel, Alert, IconButton, Dialog, DialogTitle,
   DialogContent, DialogActions, CircularProgress, Tooltip, Switch,
-  FormControlLabel, LinearProgress, Paper,
+  FormControlLabel, LinearProgress, Paper, Checkbox, Collapse,
 } from '@mui/material';
 import AddRoundedIcon from '@mui/icons-material/AddRounded';
 import EditRoundedIcon from '@mui/icons-material/EditRounded';
 import DeleteRoundedIcon from '@mui/icons-material/DeleteRounded';
 import PlayArrowRoundedIcon from '@mui/icons-material/PlayArrowRounded';
 import UploadFileRoundedIcon from '@mui/icons-material/UploadFileRounded';
+import ExpandMoreRoundedIcon from '@mui/icons-material/ExpandMoreRounded';
+import ChevronRightRoundedIcon from '@mui/icons-material/ChevronRightRounded';
+import FolderRoundedIcon from '@mui/icons-material/FolderRounded';
 
 import CheckCircleRoundedIcon from '@mui/icons-material/CheckCircleRounded';
 import ErrorRoundedIcon from '@mui/icons-material/ErrorRounded';
@@ -64,24 +67,66 @@ function StatsBar({ stats }) {
 function MetadataRow({ entry, onEdit, onDelete, onRun }) {
   return (
     <Box sx={{
-      display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1.25,
+      display: 'flex', alignItems: 'center', gap: 1, px: 2, py: 1, pl: 6,
       borderBottom: '1px solid #F1F5F9',
       '&:hover': { bgcolor: '#F8FAFC' },
       opacity: entry.active ? 1 : 0.5,
     }}>
       <Box sx={{ flex: 1, minWidth: 0 }}>
-        <Typography variant="body2" sx={{ fontWeight: 600, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <Typography variant="body2" sx={{ fontWeight: 500, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
           {entry.source_table} → {entry.target_table}
         </Typography>
         <Typography variant="caption" sx={{ color: '#94A3B8', fontSize: 11 }}>
-          {entry.source_connection} → {entry.target_connection}
-          {entry.group_name && entry.group_name !== 'default' && ` • ${entry.group_name}`}
+          {entry.source_connection} → {entry.target_connection} • {entry.strategy}
         </Typography>
       </Box>
-      <Typography variant="caption" sx={{ color: '#64748B', fontSize: 11, px: 1 }}>{entry.strategy}</Typography>
-      <Tooltip title="Run"><IconButton size="small" onClick={() => onRun(entry)}><PlayArrowRoundedIcon sx={{ fontSize: 18, color: '#10B981' }} /></IconButton></Tooltip>
-      <Tooltip title="Edit"><IconButton size="small" onClick={() => onEdit(entry)}><EditRoundedIcon sx={{ fontSize: 16, color: '#94A3B8' }} /></IconButton></Tooltip>
-      <Tooltip title="Delete"><IconButton size="small" onClick={() => onDelete(entry)}><DeleteRoundedIcon sx={{ fontSize: 16, color: '#94A3B8' }} /></IconButton></Tooltip>
+      <Tooltip title="Run"><IconButton size="small" onClick={() => onRun(entry)}><PlayArrowRoundedIcon sx={{ fontSize: 16, color: '#10B981' }} /></IconButton></Tooltip>
+      <Tooltip title="Edit"><IconButton size="small" onClick={() => onEdit(entry)}><EditRoundedIcon sx={{ fontSize: 14, color: '#94A3B8' }} /></IconButton></Tooltip>
+      <Tooltip title="Delete"><IconButton size="small" onClick={() => onDelete(entry)}><DeleteRoundedIcon sx={{ fontSize: 14, color: '#94A3B8' }} /></IconButton></Tooltip>
+    </Box>
+  );
+}
+
+function GroupRow({ groupName, entries, expanded, onToggle, selected, onSelect, onEdit, onDelete, onRun }) {
+  const activeCount = entries.filter(e => e.active).length;
+  return (
+    <Box>
+      <Box sx={{
+        display: 'flex', alignItems: 'center', gap: 0.5, px: 1.5, py: 1.25,
+        borderBottom: '1px solid #F1F5F9',
+        cursor: 'pointer',
+        '&:hover': { bgcolor: '#F8FAFC' },
+      }} onClick={onToggle}>
+        <Checkbox
+          size="small"
+          checked={selected}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => onSelect(groupName, e.target.checked)}
+          sx={{ p: 0.5 }}
+        />
+        {expanded
+          ? <ExpandMoreRoundedIcon sx={{ fontSize: 18, color: '#64748B' }} />
+          : <ChevronRightRoundedIcon sx={{ fontSize: 18, color: '#64748B' }} />
+        }
+        <FolderRoundedIcon sx={{ fontSize: 16, color: '#64748B', ml: 0.5 }} />
+        <Typography variant="body2" sx={{ fontWeight: 600, fontSize: 13, ml: 0.5 }}>
+          {groupName}
+        </Typography>
+        <Typography variant="caption" sx={{ color: '#94A3B8', ml: 1 }}>
+          {activeCount} table{activeCount !== 1 ? 's' : ''}
+        </Typography>
+      </Box>
+      <Collapse in={expanded}>
+        {entries.map((entry) => (
+          <MetadataRow
+            key={entry.id}
+            entry={entry}
+            onEdit={onEdit}
+            onDelete={onDelete}
+            onRun={onRun}
+          />
+        ))}
+      </Collapse>
     </Box>
   );
 }
@@ -247,6 +292,8 @@ export default function MetadataManager() {
   const [activeBatchId, setActiveBatchId] = useState(null);
   const [runResult, setRunResult] = useState(null);
   const [importDialogOpen, setImportDialogOpen] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState({});
+  const [selectedGroups, setSelectedGroups] = useState({});
   const fileInputRef = useRef(null);
 
   const fetchData = async () => {
@@ -327,17 +374,36 @@ export default function MetadataManager() {
     setRunResult(null);
     setActiveBatchId(null);
     try {
-      const res = await runFromMetadata({
-        group_name: filterGroup || '',
-        max_workers: 20,
-        parallel: true,
-      });
+      const selected = Object.keys(selectedGroups).filter(g => selectedGroups[g]);
+      // If specific groups selected, run them; otherwise run all
+      const payload = selected.length > 0
+        ? { group_name: selected.join(','), max_workers: 20, parallel: true }
+        : { group_name: filterGroup || '', max_workers: 20, parallel: true };
+      const res = await runFromMetadata(payload);
       setActiveBatchId(res.data.batch_id);
     } catch (e) {
       setError(e.response?.data?.detail || 'Batch run failed');
       setRunning(false);
     }
   };
+
+  const toggleGroup = (groupName) => {
+    setExpandedGroups(prev => ({ ...prev, [groupName]: !prev[groupName] }));
+  };
+
+  const handleSelectGroup = (groupName, checked) => {
+    setSelectedGroups(prev => ({ ...prev, [groupName]: checked }));
+  };
+
+  const selectedCount = Object.values(selectedGroups).filter(Boolean).length;
+
+  // Group entries by group_name
+  const groupedEntries = entries.reduce((acc, entry) => {
+    const g = entry.group_name || 'default';
+    if (!acc[g]) acc[g] = [];
+    acc[g].push(entry);
+    return acc;
+  }, {});
 
   const handleBatchComplete = (finalProgress) => {
     setRunning(false);
@@ -394,11 +460,11 @@ export default function MetadataManager() {
             onClick={openCreate}>
             Add
           </Button>
-          <Button variant="contained" color="success" disableElevation
+          <Button variant="contained" disableElevation
             startIcon={running ? <CircularProgress size={14} color="inherit" /> : <PlayArrowRoundedIcon />}
             onClick={handleRunGroup} disabled={running}
-            sx={{ borderRadius: 2, px: 2.5, textTransform: 'none', fontWeight: 600 }}>
-            {running ? 'Running…' : `Run ${filterGroup || 'All'}`}
+            sx={{ borderRadius: 2, px: 2.5, textTransform: 'none', fontWeight: 600, background: 'linear-gradient(135deg, #1D55B0, #3171D6)', boxShadow: '0 4px 14px rgba(49,113,214,0.3)', '&:hover': { boxShadow: '0 6px 20px rgba(49,113,214,0.4)' } }}>
+            {running ? 'Running…' : 'Run'}
           </Button>
         </Box>
       </Box>
@@ -412,16 +478,9 @@ export default function MetadataManager() {
 
       {/* Filters */}
       <Box sx={{ display: 'flex', gap: 2, mb: 2, alignItems: 'center' }}>
-        <FormControl size="small" sx={{ minWidth: 140 }}>
-          <InputLabel>Group</InputLabel>
-          <Select value={filterGroup} label="Group" onChange={(e) => setFilterGroup(e.target.value)}>
-            <MenuItem value="">All</MenuItem>
-            {groups.map(g => <MenuItem key={g} value={g}>{g}</MenuItem>)}
-          </Select>
-        </FormControl>
         <FormControlLabel
           control={<Switch checked={showInactive} onChange={(e) => setShowInactive(e.target.checked)} size="small" />}
-          label={<Typography variant="caption" sx={{ color: '#94A3B8' }}>Inactive</Typography>}
+          label={<Typography variant="caption" sx={{ color: '#94A3B8' }}>Show Inactive</Typography>}
         />
       </Box>
 
@@ -430,7 +489,7 @@ export default function MetadataManager() {
         <BatchProgressPanel batchId={activeBatchId} onComplete={handleBatchComplete} />
       )}
 
-      {/* Table List */}
+      {/* Group List */}
       {loading ? (
         <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}><CircularProgress /></Box>
       ) : entries.length === 0 ? (
@@ -441,10 +500,15 @@ export default function MetadataManager() {
         />
       ) : (
         <Paper elevation={0} sx={{ border: '1px solid #E2E8F0', borderRadius: 2, overflow: 'hidden' }}>
-          {entries.map((entry) => (
-            <MetadataRow
-              key={entry.id}
-              entry={entry}
+          {Object.keys(groupedEntries).sort().map((groupName) => (
+            <GroupRow
+              key={groupName}
+              groupName={groupName}
+              entries={groupedEntries[groupName]}
+              expanded={!!expandedGroups[groupName]}
+              onToggle={() => toggleGroup(groupName)}
+              selected={!!selectedGroups[groupName]}
+              onSelect={handleSelectGroup}
               onEdit={openEdit}
               onDelete={handleDelete}
               onRun={handleRunSingle}

@@ -8,10 +8,10 @@ import TableChartRoundedIcon from '@mui/icons-material/TableChartRounded';
 const WIDTH = 64;
 
 const NAV = [
-  { label: 'Dashboard', icon: DashboardRoundedIcon, path: '/' },
-  { label: 'Test Suite', icon: PlayCircleFilledRoundedIcon, path: '/suite' },
-  { label: 'Validations', icon: TableChartRoundedIcon, path: '/metadata' },
-  { label: 'Connections', icon: CableRoundedIcon, path: '/connections' },
+  { label: 'Overview', icon: DashboardRoundedIcon, path: '/' },
+  { label: 'Compare', icon: PlayCircleFilledRoundedIcon, path: '/suite' },
+  { label: 'Batch Runs', icon: TableChartRoundedIcon, path: '/metadata' },
+  { label: 'Sources', icon: CableRoundedIcon, path: '/connections' },
 ];
 
 const NAVY_HOVER = '#525B7E';
