@@ -70,13 +70,14 @@ export default function SuiteRunner({ onResult }) {
   const [uploadedFile, setUploadedFile] = useState(null);
 
   const [checks, setChecks] = useState(['row_count', 'metadata', 'null_check']);
-  const [strategy, setStrategy] = useState('hash');
+  const [strategy, setStrategy] = useState('auto');
   const [samplePct, setSamplePct] = useState(10);
   const [drillDown, setDrillDown] = useState(true);
   const [showOptions, setShowOptions] = useState(false);
   const [parallel, setParallel] = useState(false);
   const [workers, setWorkers] = useState(4);
   const [failFast, setFailFast] = useState(false);
+  const [incremental, setIncremental] = useState(false);
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(null);
   const [error, setError] = useState('');
@@ -155,7 +156,7 @@ export default function SuiteRunner({ onResult }) {
         const pairChecks = pair.keyCols?.trim()
           ? checkSpecs.map((s) => s.type === 'data' ? { ...s, join_keys: pair.keyCols.split(',').map((k) => k.trim()) } : s)
           : checkSpecs;
-        const payload = { checks: pairChecks, suite_name: suiteName.trim(), parallel, max_workers: workers, fail_fast: failFast, batch_id: batchId };
+        const payload = { checks: pairChecks, suite_name: suiteName.trim(), parallel, max_workers: workers, fail_fast: failFast, batch_id: batchId, incremental };
 
         // Resolve file paths: saved CSV connections prepend their base path
         const resolvePath = (conn, rawPath) => {
@@ -371,6 +372,8 @@ export default function SuiteRunner({ onResult }) {
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
                 <FormControl fullWidth size="small">
                   <Select value={strategy} onChange={(e) => setStrategy(e.target.value)} sx={{ fontSize: '0.8rem' }}>
+                    <MenuItem value="auto">Auto (intelligent)</MenuItem>
+                    <MenuItem value="minus">MINUS (server-side)</MenuItem>
                     <MenuItem value="hash">Hash (fastest)</MenuItem>
                     <MenuItem value="full">Full diff</MenuItem>
                     <MenuItem value="sample">Sample %</MenuItem>
@@ -415,6 +418,11 @@ export default function SuiteRunner({ onResult }) {
                 <FormControlLabel
                   control={<Switch checked={failFast} onChange={(e) => setFailFast(e.target.checked)} size="small" />}
                   label={<Typography sx={{ fontSize: '0.78rem', color: '#475569' }}>Stop on first failure</Typography>}
+                  sx={{ m: 0 }}
+                />
+                <FormControlLabel
+                  control={<Switch checked={incremental} onChange={(e) => setIncremental(e.target.checked)} size="small" color="secondary" />}
+                  label={<Typography sx={{ fontSize: '0.78rem', color: '#475569' }}>Incremental (only changed rows)</Typography>}
                   sx={{ m: 0 }}
                 />
               </Box>

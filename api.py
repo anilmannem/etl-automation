@@ -108,6 +108,9 @@ class AdhocRequest(BaseModel):
     max_workers: int = 4
     fail_fast: bool = False
     batch_id: str = ""
+    # Intelligent features
+    incremental: bool = False
+    timestamp_column: str = "DL_UPDATE_TS"
 
 
 class HistoryQuery(BaseModel):
@@ -392,6 +395,8 @@ def run_checks(req: AdhocRequest):
             parallel=req.parallel,
             max_workers=req.max_workers,
             fail_fast=req.fail_fast,
+            incremental=req.incremental,
+            timestamp_column=req.timestamp_column,
         )
 
         rs = ResultStore()
@@ -603,6 +608,111 @@ def get_history(suite: str = "", days: int = 30):
         "trend": trend,
         "score_trend": score_trend,
     }
+
+
+# ── Intelligent Engine Endpoints ─────────────────────────────────────────────
+
+class LineageEntry(BaseModel):
+    source_table: str
+    target_table: str
+
+
+class JobQueueRequest(BaseModel):
+    batch_id: str
+    jobs: list[dict]
+
+
+@app.get("/api/intelligence/profile/{table_name}")
+def get_table_profile(table_name: str):
+    """Get the stored profile for a table (row count, strategy performance, watermark)."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        profile = store.get_profile(table_name)
+        best_strategy = store.get_best_strategy(table_name)
+        store.close()
+        return {
+            "table_name": table_name,
+            "profile": profile,
+            "best_strategy": best_strategy,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intelligence/lineage")
+def set_lineage(entry: LineageEntry):
+    """Define a lineage relationship (source feeds target)."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        store.set_lineage(entry.source_table, entry.target_table)
+        downstream = store.get_downstream(entry.source_table)
+        store.close()
+        return {"status": "ok", "downstream_count": len(downstream)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/intelligence/lineage/{table_name}")
+def get_lineage(table_name: str):
+    """Get upstream and downstream tables for a given table."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        upstream = store.get_upstream(table_name)
+        downstream = store.get_downstream(table_name)
+        store.close()
+        return {
+            "table_name": table_name,
+            "upstream": upstream,
+            "downstream": downstream,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intelligence/queue")
+def enqueue_jobs(req: JobQueueRequest):
+    """Add validation jobs to the work-stealing queue."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        store.enqueue_jobs(req.batch_id, req.jobs)
+        progress = store.get_batch_progress(req.batch_id)
+        store.close()
+        return progress
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/intelligence/queue/{batch_id}")
+def get_queue_progress(batch_id: str):
+    """Get progress of a queued batch."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        progress = store.get_batch_progress(batch_id)
+        store.close()
+        return progress
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intelligence/queue/claim/{worker_id}")
+def claim_job(worker_id: str):
+    """Worker claims the next available job (work-stealing pattern)."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        job = store.claim_next_job(worker_id)
+        store.close()
+        if not job:
+            return {"status": "empty", "message": "No pending jobs"}
+        return {"status": "claimed", "job": job}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 

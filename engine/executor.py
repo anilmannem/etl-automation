@@ -6,6 +6,10 @@ Supports:
 - Per-check timing and progress callbacks
 - Fail-fast mode: stop on first failure
 - Check dependency ordering via ``depends_on``
+- Incremental validation (watermark-based delta)
+- Root cause classification of failures
+- Lineage-aware cascade skip
+- Strategy performance tracking
 """
 
 from __future__ import annotations
@@ -223,6 +227,9 @@ def execute_suite(
     max_workers: int = 4,
     fail_fast: bool = False,
     progress_callback: Callable[[int, int, CheckResult], None] | None = None,
+    incremental: bool = False,
+    timestamp_column: str = "DL_UPDATE_TS",
+    lineage_skip: bool = True,
 ) -> SuiteResult:
     """Execute every check in a TestSuite.
 
@@ -234,10 +241,34 @@ def execute_suite(
     max_workers : thread-pool size for parallel mode
     fail_fast : stop on first failure
     progress_callback : called after each check with (current, total, result)
+    incremental : if True, use watermark-based delta validation (only changed rows)
+    timestamp_column : column name to use for incremental watermark
+    lineage_skip : if True, skip downstream checks when upstream fails
     """
     run_id = run_id or uuid.uuid4().hex[:12]
     logger.info("Starting suite '%s' (run=%s, parallel=%s) with %d check(s)",
                 suite.name, run_id, parallel, len(suite.checks))
+
+    # ── Incremental mode: inject watermark WHERE clause ──────────────────────
+    if incremental:
+        try:
+            from .intelligent import IntelligentStore, build_incremental_where
+            store = IntelligentStore()
+            for check_config in suite.checks:
+                if check_config.check_type in ("data", "row_count"):
+                    table_name = check_config.source_table or check_config.target_table
+                    dsn = getattr(suite.source, 'dsn', '') if hasattr(suite, 'source') else ''
+                    new_where, is_incr = build_incremental_where(
+                        table_name, timestamp_column, store,
+                        existing_where=check_config.where, dsn=dsn,
+                    )
+                    if is_incr:
+                        check_config.where = new_where
+                        check_config.extra["_incremental"] = True
+                        logger.info("INCREMENTAL: %s filtered by watermark", table_name)
+            store.close()
+        except Exception as e:
+            logger.debug("Incremental setup failed (non-fatal): %s", e)
 
     start = time.time()
     results: list[CheckResult] = []
@@ -309,6 +340,73 @@ def execute_suite(
         timings=timings,
         duration_seconds=duration,
     )
+
+    # ── Post-execution intelligence ──────────────────────────────────────────
+    try:
+        from .intelligent import (IntelligentStore, classify_failure,
+                                  detect_anomalies, get_current_watermark)
+        store = IntelligentStore()
+
+        for result, timing in zip(results, timings):
+            metrics = result.metrics if result.metrics else {}
+
+            # Root cause classification for failures
+            if result.status in (Status.FAIL, Status.ERROR) and result.check_type == "data":
+                src_count = metrics.get("src_row_count", 0)
+                tgt_count = metrics.get("tgt_row_count", 0)
+                root_cause = classify_failure(metrics, src_count, tgt_count)
+                result.metrics["root_cause"] = root_cause.classification
+                result.metrics["root_cause_severity"] = root_cause.severity
+                result.metrics["root_cause_message"] = root_cause.message
+                result.metrics["auto_retry"] = root_cause.auto_retry
+                logger.info("ROOT CAUSE [%s]: %s — %s",
+                            root_cause.severity, root_cause.classification,
+                            root_cause.message)
+
+            # Track strategy performance
+            strategy_used = metrics.get("strategy", "")
+            if strategy_used and result.check_type == "data":
+                src_count = metrics.get("src_row_count", 0)
+                table_name = suite.checks[0].source_table if suite.checks else ""
+                store.record_strategy_performance(
+                    table_name, strategy_used, src_count,
+                    timing.duration_s, result.status == Status.PASS,
+                )
+
+            # Anomaly detection
+            if result.check_type in ("data", "row_count"):
+                table_name = suite.checks[0].source_table if suite.checks else ""
+                anomalies = detect_anomalies(metrics, table_name, store)
+                if anomalies:
+                    result.metrics["anomalies"] = anomalies
+                    for a in anomalies:
+                        logger.warning("ANOMALY [%s]: %s", a["severity"], a["message"])
+
+                # Update table profile with latest row count
+                if metrics.get("src_row_count"):
+                    store.update_profile(table_name, row_count=metrics["src_row_count"])
+
+        # Update watermark on successful data check (for incremental mode)
+        if incremental and any(r.status == Status.PASS and r.check_type == "data"
+                               for r in results):
+            table_name = suite.checks[0].source_table if suite.checks else ""
+            if table_name:
+                # Get connector to fetch current max timestamp
+                try:
+                    src_conn_wm = get_connector(suite.source_platform, suite.source)
+                    src_conn_wm.connect()
+                    wm = get_current_watermark(src_conn_wm, table_name, timestamp_column)
+                    if wm:
+                        store.set_watermark(table_name, wm)
+                        logger.info("WATERMARK updated for %s: %s", table_name, wm)
+                    src_conn_wm.close()
+                except Exception as e:
+                    logger.debug("Watermark update failed (non-fatal): %s", e)
+
+        store.close()
+    except Exception as e:
+        logger.debug("Post-execution intelligence failed (non-fatal): %s", e)
+
     logger.info(
         "Suite '%s' completed in %.1fs — score=%.1f%% — %s",
         suite.name, duration, suite_result.quality_score,

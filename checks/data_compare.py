@@ -334,8 +334,61 @@ class DataCheck(BaseCheck):
             # Stream the SQL side into DuckDB in chunks, then diff both in-engine.
             return self._duckdb_bridge_strategy(src_conn, tgt_conn, config)
 
-        strategy = config.extra.get("strategy", "full")
+        # ── Pyramid Validation: aggregate-first shortcut ─────────────────────
+        # If pyramid mode is enabled (default for DB↔DB), do a quick aggregate
+        # pre-check. If row counts + SUMs match, skip the expensive comparison.
+        use_pyramid = config.extra.get("pyramid", True)  # enabled by default
+        if use_pyramid and not config.extra.get("_pyramid_done"):
+            try:
+                from ..engine.intelligent import pyramid_aggregate_check
+                pyramid_result = pyramid_aggregate_check(
+                    src_conn, tgt_conn,
+                    config.source_table, config.target_table,
+                    where=config.where,
+                )
+                if pyramid_result["passed"]:
+                    logger.info("PYRAMID PASS: %s — skipping detailed comparison",
+                                pyramid_result["reason"])
+                    return CheckResult(
+                        check_type=self.name,
+                        status=Status.PASS,
+                        metrics={
+                            "src_row_count": pyramid_result["src_count"],
+                            "tgt_row_count": pyramid_result["tgt_count"],
+                            "match_pct": 100.0,
+                            "rows_only_in_source": 0,
+                            "rows_only_in_target": 0,
+                            "rows_with_diffs": 0,
+                            "comparison_mode": "pyramid",
+                            "join_keys_used": "N/A (aggregate match)",
+                            "strategy": "pyramid",
+                        },
+                        message=f"PYRAMID PASS: {pyramid_result['reason']}",
+                    )
+                else:
+                    logger.info("PYRAMID FAIL: %s — drilling into detailed comparison",
+                                pyramid_result["reason"])
+            except Exception as e:
+                logger.debug("Pyramid pre-check failed (non-fatal): %s", e)
+
+        # ── Adaptive Strategy Selection ──────────────────────────────────────
+        strategy = config.extra.get("strategy", "auto")
         sample_pct = config.extra.get("sample_pct", 10)
+
+        if strategy == "auto":
+            try:
+                from ..engine.intelligent import select_optimal_strategy, IntelligentStore
+                store = IntelligentStore()
+                recommendation = select_optimal_strategy(
+                    src_conn, tgt_conn, config.source_table, store=store,
+                )
+                strategy = recommendation.strategy
+                logger.info("ADAPTIVE: Selected '%s' strategy — %s",
+                            strategy, recommendation.reason)
+                store.close()
+            except Exception as e:
+                logger.debug("Adaptive selection failed (non-fatal): %s — defaulting to full", e)
+                strategy = "full"
 
         # Auto-select minus strategy when both sides are Teradata (same instance)
         if strategy == "minus" or (

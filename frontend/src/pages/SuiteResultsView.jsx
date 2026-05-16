@@ -86,6 +86,8 @@ const METRIC_LABELS = {
   rows_with_diffs: 'Rows with diffs', cell_diffs_found: 'Cell diffs',
   comparison_mode: 'Comparison mode', join_keys_used: 'Join keys',
   duplicate_rows_src: 'Duplicates (src)', duplicate_rows_tgt: 'Duplicates (tgt)',
+  strategy: 'Strategy', root_cause: 'Root cause',
+  root_cause_severity: 'Severity', root_cause_message: 'Diagnosis',
 };
 const fmtMetric = (k) => METRIC_LABELS[k] || k.replace(/_/g, ' ');
 const fmtVal = (v) => v === null || v === undefined ? '—' : typeof v === 'number' ? v.toLocaleString() : String(v);

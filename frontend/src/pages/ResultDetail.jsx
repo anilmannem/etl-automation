@@ -41,6 +41,8 @@ const METRIC_LABELS = {
   comparison_mode: 'Comparison mode', join_keys_used: 'Join keys used',
   value_mismatches: 'Value mismatches', mismatch_count: 'Mismatches',
   duplicate_rows_src: 'Duplicates (source)', duplicate_rows_tgt: 'Duplicates (target)',
+  strategy: 'Strategy', root_cause: 'Root cause',
+  root_cause_severity: 'Severity', root_cause_message: 'Diagnosis',
 };
 const fmtMetric = (k) => METRIC_LABELS[k] || k.replace(/_/g, ' ');
 const fmtType = (t) => ({ row_count: 'Row Count', metadata: 'Metadata', null_check: 'Null Analysis', data: 'Data Comparison', duplicate: 'Duplicate Check', aggregate: 'Aggregates' }[t] || t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()));
@@ -363,9 +365,40 @@ function DataSummary({ metrics }) {
   const matchColor = matchPct >= 90 ? '#059669' : matchPct >= 70 ? '#D97706' : '#DC2626';
   const isPositional = (metrics.comparison_mode ?? '') === 'positional';
   const joinKeys = metrics.join_keys_used ?? '';
+  const strategy = metrics.strategy ?? '';
+  const rootCause = metrics.root_cause ?? '';
+  const rootCauseMsg = metrics.root_cause_message ?? '';
+  const rootCauseSeverity = metrics.root_cause_severity ?? '';
+  const isPyramid = strategy === 'pyramid';
 
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+      {/* Pyramid pass banner */}
+      {isPyramid && (
+        <Box sx={{
+          display: 'flex', alignItems: 'center', gap: 1, px: 1.5, py: 0.75,
+          bgcolor: '#ECFDF5', border: '1px solid #6EE7B7', borderRadius: '8px',
+        }}>
+          <CheckCircleRoundedIcon sx={{ fontSize: 14, color: '#059669' }} />
+          <Typography sx={{ fontSize: '0.65rem', color: '#065F46', lineHeight: 1.4 }}>
+            <strong>Pyramid PASS</strong> — Row counts and aggregate SUMs match. Detailed row comparison was skipped (not needed).
+          </Typography>
+        </Box>
+      )}
+      {/* Root cause diagnosis banner */}
+      {rootCause && rootCause !== 'PASS' && (
+        <Box sx={{
+          display: 'flex', alignItems: 'center', gap: 1, px: 1.5, py: 0.75,
+          bgcolor: rootCauseSeverity === 'CRITICAL' ? '#FEF2F2' : '#FFFBEB',
+          border: `1px solid ${rootCauseSeverity === 'CRITICAL' ? '#FECACA' : '#FCD34D'}`,
+          borderRadius: '8px',
+        }}>
+          <ErrorOutlineRoundedIcon sx={{ fontSize: 14, color: rootCauseSeverity === 'CRITICAL' ? '#DC2626' : '#D97706' }} />
+          <Typography sx={{ fontSize: '0.65rem', color: rootCauseSeverity === 'CRITICAL' ? '#991B1B' : '#92400E', lineHeight: 1.4 }}>
+            <strong>Root Cause: {rootCause.replace(/_/g, ' ')}</strong> — {rootCauseMsg}
+          </Typography>
+        </Box>
+      )}
       {/* Positional mode warning banner */}
       {isPositional && (
         <Box sx={{
