@@ -714,5 +714,337 @@ def claim_job(worker_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Validation Metadata Management ──────────────────────────────────────────
+
+class MetadataEntry(BaseModel):
+    group_name: str = "default"
+    source_connection: str
+    source_table: str
+    target_connection: str
+    target_table: str
+    join_keys: str = ""
+    check_types: str = "row_count,data"
+    strategy: str = "auto"
+    priority: float = 50.0
+    tolerance: float = 0.0
+    where_clause: str = ""
+    ignore_columns: str = "DL_INSERT_TS,DL_UPDATE_TS"
+    timestamp_column: str = "DL_UPDATE_TS"
+    schedule: str = "daily"
+    active: bool = True
+    tags: str = ""
+    notes: str = ""
+
+
+class MetadataUpdate(BaseModel):
+    group_name: str | None = None
+    source_connection: str | None = None
+    source_table: str | None = None
+    target_connection: str | None = None
+    target_table: str | None = None
+    join_keys: str | None = None
+    check_types: str | None = None
+    strategy: str | None = None
+    priority: float | None = None
+    tolerance: float | None = None
+    where_clause: str | None = None
+    ignore_columns: str | None = None
+    timestamp_column: str | None = None
+    schedule: str | None = None
+    active: bool | None = None
+    tags: str | None = None
+    notes: str | None = None
+
+
+class BulkImportRequest(BaseModel):
+    entries: list[dict]
+
+
+class RunFromMetadataRequest(BaseModel):
+    group_name: str = ""
+    ids: list[int] = []
+    parallel: bool = False
+    max_workers: int = 4
+    incremental: bool = False
+    fail_fast: bool = False
+
+
+@app.get("/api/metadata")
+def list_metadata(group: str = "", active_only: bool = True):
+    """List all validation metadata entries."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        entries = store.get_all_metadata(group=group, active_only=active_only)
+        stats = store.get_metadata_stats()
+        groups = store.get_metadata_groups()
+        store.close()
+        return {"entries": entries, "stats": stats, "groups": groups}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/metadata/{meta_id}")
+def get_metadata(meta_id: int):
+    """Get a single metadata entry by ID."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        entry = store.get_metadata_by_id(meta_id)
+        store.close()
+        if not entry:
+            raise HTTPException(status_code=404, detail="Not found")
+        return entry
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/metadata")
+def create_metadata(entry: MetadataEntry):
+    """Create a new validation metadata entry."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        data = entry.model_dump()
+        data["active"] = int(data["active"])
+        new_id = store.create_metadata(data)
+        store.close()
+        return {"id": new_id, "status": "created"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/metadata/{meta_id}")
+def update_metadata(meta_id: int, updates: MetadataUpdate):
+    """Update an existing metadata entry."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        data = {k: v for k, v in updates.model_dump().items() if v is not None}
+        if "active" in data:
+            data["active"] = int(data["active"])
+        ok = store.update_metadata(meta_id, data)
+        store.close()
+        if not ok:
+            raise HTTPException(status_code=404, detail="Not found or no valid fields")
+        return {"status": "updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/metadata/{meta_id}")
+def delete_metadata(meta_id: int):
+    """Delete a metadata entry."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        ok = store.delete_metadata(meta_id)
+        store.close()
+        if not ok:
+            raise HTTPException(status_code=404, detail="Not found")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/metadata/bulk-import")
+def bulk_import_metadata(req: BulkImportRequest):
+    """Bulk import metadata entries (from Excel/CSV upload)."""
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+        count = store.bulk_import_metadata(req.entries)
+        store.close()
+        return {"status": "imported", "count": count, "total_submitted": len(req.entries)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/metadata/run")
+def run_from_metadata(req: RunFromMetadataRequest):
+    """Run validations from metadata entries (by group or specific IDs).
+
+    This generates and executes suites from the metadata table — no YAML needed.
+    """
+    try:
+        from etl_validator.engine.intelligent import IntelligentStore
+        store = IntelligentStore()
+
+        # Get entries to run
+        if req.ids:
+            entries = [store.get_metadata_by_id(i) for i in req.ids]
+            entries = [e for e in entries if e]
+        else:
+            entries = store.get_all_metadata(group=req.group_name, active_only=True)
+
+        if not entries:
+            raise HTTPException(status_code=404, detail="No metadata entries found")
+
+        store.close()
+
+        # Execute each entry as a suite
+        batch_id = uuid.uuid4().hex[:12]
+        all_results = []
+
+        for entry in entries:
+            try:
+                # Build check specs from metadata
+                check_types = [ct.strip() for ct in entry["check_types"].split(",") if ct.strip()]
+                check_specs = []
+                for ct in check_types:
+                    spec = {"type": ct, "strategy": entry.get("strategy", "auto")}
+                    if entry.get("join_keys"):
+                        spec["join_keys"] = [k.strip() for k in entry["join_keys"].split(",") if k.strip()]
+                    check_specs.append(spec)
+
+                # Build the adhoc-style payload and reuse existing run logic
+                payload = {
+                    "source_connection_id": None,
+                    "source_table": entry["source_table"],
+                    "target_table": entry["target_table"],
+                    "checks": check_specs,
+                    "suite_name": f"{entry['group_name']}/{entry['source_table']}",
+                    "parallel": req.parallel,
+                    "max_workers": req.max_workers,
+                    "fail_fast": req.fail_fast,
+                    "batch_id": batch_id,
+                    "where": entry.get("where_clause", ""),
+                    "incremental": req.incremental,
+                }
+
+                # Resolve connections by name
+                db = _conn_db()
+                src_row = db.execute(
+                    "SELECT * FROM connections WHERE name = ?",
+                    (entry["source_connection"],),
+                ).fetchone()
+                tgt_row = db.execute(
+                    "SELECT * FROM connections WHERE name = ?",
+                    (entry["target_connection"],),
+                ).fetchone()
+                db.close()
+
+                if not src_row or not tgt_row:
+                    all_results.append({
+                        "table": entry["source_table"],
+                        "status": "Error",
+                        "message": f"Connection not found: src={entry['source_connection']}, tgt={entry['target_connection']}",
+                    })
+                    continue
+
+                # Build connection configs
+                src_config = ConnectionConfig(
+                    platform=src_row["platform"],
+                    dsn=src_row["dsn"] or "",
+                    host=src_row["host"] or "",
+                    port=src_row["port"] or 0,
+                    user=src_row["username"] or "",
+                    password=src_row["password"] or "",
+                    database=src_row["database_name"] or "",
+                    schema=src_row["schema_name"] or "",
+                    extra={"file_path": src_row["file_path"]} if src_row["file_path"] else {},
+                )
+                tgt_config = ConnectionConfig(
+                    platform=tgt_row["platform"],
+                    dsn=tgt_row["dsn"] or "",
+                    host=tgt_row["host"] or "",
+                    port=tgt_row["port"] or 0,
+                    user=tgt_row["username"] or "",
+                    password=tgt_row["password"] or "",
+                    database=tgt_row["database_name"] or "",
+                    schema=tgt_row["schema_name"] or "",
+                    extra={"file_path": tgt_row["file_path"]} if tgt_row["file_path"] else {},
+                )
+
+                # Build and execute suite
+                from etl_validator.checks.base import CheckConfig
+                from etl_validator.engine.executor import execute_suite
+                from etl_validator.engine.suite_loader import TestSuite
+
+                checks = []
+                for spec in check_specs:
+                    cc = CheckConfig(
+                        check_type=spec["type"],
+                        source_table=entry["source_table"],
+                        target_table=entry["target_table"],
+                        join_keys=spec.get("join_keys", []),
+                        ignore_columns=[c.strip() for c in entry.get("ignore_columns", "").split(",") if c.strip()],
+                        where=entry.get("where_clause", ""),
+                        tolerance=entry.get("tolerance", 0),
+                        extra={"strategy": spec.get("strategy", "auto")},
+                    )
+                    checks.append(cc)
+
+                suite = TestSuite(
+                    name=f"{entry['group_name']}/{entry['source_table']}",
+                    source=src_config,
+                    target=tgt_config,
+                    source_platform=src_row["platform"],
+                    target_platform=tgt_row["platform"],
+                    checks=checks,
+                )
+
+                result = execute_suite(
+                    suite,
+                    parallel=req.parallel,
+                    max_workers=req.max_workers,
+                    fail_fast=req.fail_fast,
+                    incremental=req.incremental,
+                    timestamp_column=entry.get("timestamp_column", "DL_UPDATE_TS"),
+                )
+
+                # Store results
+                rs = ResultStore()
+                rs.record_suite(result, batch_id=batch_id,
+                                source=entry["source_table"],
+                                target=entry["target_table"])
+                rs.close()
+
+                all_results.append({
+                    "table": entry["source_table"],
+                    "status": str(result.overall_status),
+                    "quality_score": result.quality_score,
+                    "checks": len(result.results),
+                    "passed": result.passed,
+                    "failed": result.failed,
+                    "duration_s": round(result.duration_seconds, 2),
+                })
+
+            except Exception as e:
+                log.exception("Metadata run failed for %s", entry.get("source_table", "?"))
+                all_results.append({
+                    "table": entry.get("source_table", "?"),
+                    "status": "Error",
+                    "message": str(e),
+                })
+
+        # Summary
+        total = len(all_results)
+        passed = sum(1 for r in all_results if r.get("status") == "Pass")
+        failed = sum(1 for r in all_results if r.get("status") == "Fail")
+        errors = sum(1 for r in all_results if r.get("status") == "Error")
+
+        return {
+            "batch_id": batch_id,
+            "total": total,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "results": all_results,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("run_from_metadata failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 

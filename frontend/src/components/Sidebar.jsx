@@ -3,6 +3,7 @@ import { Box, Drawer, Tooltip } from '@mui/material';
 import DashboardRoundedIcon from '@mui/icons-material/DashboardRounded';
 import PlayCircleFilledRoundedIcon from '@mui/icons-material/PlayCircleFilledRounded';
 import CableRoundedIcon from '@mui/icons-material/CableRounded';
+import TableChartRoundedIcon from '@mui/icons-material/TableChartRounded';
 
 const WIDTH = 64;
 
@@ -10,6 +11,7 @@ const NAV = [
   { label: 'Dashboard', icon: DashboardRoundedIcon, path: '/' },
   { label: 'Test Suite', icon: PlayCircleFilledRoundedIcon, path: '/suite' },
   { label: 'Connections', icon: CableRoundedIcon, path: '/connections' },
+  { label: 'Metadata', icon: TableChartRoundedIcon, path: '/metadata' },
 ];
 
 const NAVY_HOVER = '#525B7E';

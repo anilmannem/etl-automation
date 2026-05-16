@@ -8,6 +8,7 @@ import SuiteRunner from './pages/SuiteRunner';
 import Connections from './pages/Connections';
 import ResultDetail from './pages/ResultDetail';
 import SuiteResultsView from './pages/SuiteResultsView';
+import MetadataManager from './pages/MetadataManager';
 import { getBatchResult } from './api';
 
 function BatchResultPage() {
@@ -61,6 +62,7 @@ export default function App() {
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/connections" element={<Connections />} />
+              <Route path="/metadata" element={<MetadataManager />} />
               <Route path="/suite" element={<SuiteRunner onResult={setLastResult} />} />
               <Route path="/results/batch/:batchId" element={<BatchResultPage />} />
               <Route path="/results/:runId" element={<ResultDetail />} />

@@ -80,6 +80,33 @@ CREATE TABLE IF NOT EXISTS job_queue (
 
 CREATE INDEX IF NOT EXISTS idx_queue_status ON job_queue(status, priority DESC);
 CREATE INDEX IF NOT EXISTS idx_queue_batch ON job_queue(batch_id);
+
+CREATE TABLE IF NOT EXISTS validation_metadata (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name      TEXT NOT NULL DEFAULT 'default',
+    source_connection TEXT NOT NULL,
+    source_table    TEXT NOT NULL,
+    target_connection TEXT NOT NULL,
+    target_table    TEXT NOT NULL,
+    join_keys       TEXT DEFAULT '',
+    check_types     TEXT NOT NULL DEFAULT 'row_count,data',
+    strategy        TEXT NOT NULL DEFAULT 'auto',
+    priority        REAL NOT NULL DEFAULT 50.0,
+    tolerance       REAL DEFAULT 0.0,
+    where_clause    TEXT DEFAULT '',
+    ignore_columns  TEXT DEFAULT 'DL_INSERT_TS,DL_UPDATE_TS',
+    timestamp_column TEXT DEFAULT 'DL_UPDATE_TS',
+    schedule        TEXT DEFAULT 'daily',
+    active          INTEGER NOT NULL DEFAULT 1,
+    tags            TEXT DEFAULT '',
+    notes           TEXT DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_meta_group ON validation_metadata(group_name);
+CREATE INDEX IF NOT EXISTS idx_meta_active ON validation_metadata(active);
+CREATE INDEX IF NOT EXISTS idx_meta_priority ON validation_metadata(priority DESC);
 """
 
 
@@ -301,6 +328,112 @@ class IntelligentStore:
 
     def close(self):
         self._conn.close()
+
+    # ── Validation Metadata CRUD ─────────────────────────────────────────────
+
+    def get_all_metadata(self, group: str = "", active_only: bool = True) -> list[dict]:
+        """List all validation metadata entries."""
+        query = "SELECT * FROM validation_metadata WHERE 1=1"
+        params = []
+        if active_only:
+            query += " AND active = 1"
+        if group:
+            query += " AND group_name = ?"
+            params.append(group)
+        query += " ORDER BY priority DESC, group_name, source_table"
+        cursor = self._conn.execute(query, params)
+        cols = [d[0] for d in cursor.description]
+        return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+    def get_metadata_by_id(self, meta_id: int) -> dict | None:
+        cursor = self._conn.execute(
+            "SELECT * FROM validation_metadata WHERE id = ?", (meta_id,)
+        )
+        cols = [d[0] for d in cursor.description]
+        row = cursor.fetchone()
+        return dict(zip(cols, row)) if row else None
+
+    def create_metadata(self, entry: dict) -> int:
+        """Insert a new validation metadata entry. Returns the new ID."""
+        allowed = {
+            "group_name", "source_connection", "source_table",
+            "target_connection", "target_table", "join_keys", "check_types",
+            "strategy", "priority", "tolerance", "where_clause",
+            "ignore_columns", "timestamp_column", "schedule", "active",
+            "tags", "notes",
+        }
+        filtered = {k: v for k, v in entry.items() if k in allowed}
+        cols = ", ".join(filtered.keys())
+        placeholders = ", ".join("?" * len(filtered))
+        cursor = self._conn.execute(
+            f"INSERT INTO validation_metadata ({cols}) VALUES ({placeholders})",
+            list(filtered.values()),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def update_metadata(self, meta_id: int, updates: dict) -> bool:
+        """Update an existing metadata entry."""
+        allowed = {
+            "group_name", "source_connection", "source_table",
+            "target_connection", "target_table", "join_keys", "check_types",
+            "strategy", "priority", "tolerance", "where_clause",
+            "ignore_columns", "timestamp_column", "schedule", "active",
+            "tags", "notes",
+        }
+        filtered = {k: v for k, v in updates.items() if k in allowed}
+        if not filtered:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in filtered)
+        values = list(filtered.values()) + [meta_id]
+        self._conn.execute(
+            f"UPDATE validation_metadata SET {sets}, updated_at = datetime('now') WHERE id = ?",
+            values,
+        )
+        self._conn.commit()
+        return True
+
+    def delete_metadata(self, meta_id: int) -> bool:
+        cursor = self._conn.execute(
+            "DELETE FROM validation_metadata WHERE id = ?", (meta_id,)
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def bulk_import_metadata(self, entries: list[dict]) -> int:
+        """Bulk import metadata entries (from Excel/CSV). Returns count inserted."""
+        count = 0
+        for entry in entries:
+            try:
+                self.create_metadata(entry)
+                count += 1
+            except Exception as e:
+                logger.warning("Skipping metadata entry: %s", e)
+        return count
+
+    def get_metadata_groups(self) -> list[str]:
+        """List all distinct group names."""
+        cursor = self._conn.execute(
+            "SELECT DISTINCT group_name FROM validation_metadata ORDER BY group_name"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def get_metadata_stats(self) -> dict:
+        """Summary stats for the metadata table."""
+        cursor = self._conn.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) as active,
+                COUNT(DISTINCT group_name) as groups,
+                COUNT(DISTINCT source_connection) as source_connections,
+                COUNT(DISTINCT target_connection) as target_connections
+            FROM validation_metadata
+        """)
+        row = cursor.fetchone()
+        return {
+            "total": row[0], "active": row[1], "groups": row[2],
+            "source_connections": row[3], "target_connections": row[4],
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -26,4 +26,14 @@ export const getHistory = (suite = '', days = 30) =>
 export const getRunResult = (runId) => api.get(`/api/history/${runId}`);
 export const getBatchResult = (batchId) => api.get(`/api/history/batch/${batchId}`);
 
+// Metadata Management
+export const listMetadata = (group = '', activeOnly = true) =>
+  api.get('/api/metadata', { params: { group, active_only: activeOnly } });
+export const getMetadata = (id) => api.get(`/api/metadata/${id}`);
+export const createMetadata = (data) => api.post('/api/metadata', data);
+export const updateMetadata = (id, data) => api.put(`/api/metadata/${id}`, data);
+export const deleteMetadata = (id) => api.delete(`/api/metadata/${id}`);
+export const bulkImportMetadata = (entries) => api.post('/api/metadata/bulk-import', { entries });
+export const runFromMetadata = (data) => api.post('/api/metadata/run', data);
+
 export default api;
