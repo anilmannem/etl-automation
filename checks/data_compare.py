@@ -948,17 +948,21 @@ class DataCheck(BaseCheck):
         chunk_size = config.chunk_size
 
         # Stream hashes in chunks to avoid OOM on large tables
-        src_chunks = []
-        for chunk in src_conn.execute_streaming(src_hash_q, chunk_size):
-            chunk.columns = [c.upper() for c in chunk.columns]
-            src_chunks.append(chunk)
-        src_hashes = pd.concat(src_chunks, ignore_index=True) if src_chunks else pd.DataFrame()
+        try:
+            src_chunks = []
+            for chunk in src_conn.execute_streaming(src_hash_q, chunk_size):
+                chunk.columns = [c.upper() for c in chunk.columns]
+                src_chunks.append(chunk)
+            src_hashes = pd.concat(src_chunks, ignore_index=True) if src_chunks else pd.DataFrame()
 
-        tgt_chunks = []
-        for chunk in tgt_conn.execute_streaming(tgt_hash_q, chunk_size):
-            chunk.columns = [c.upper() for c in chunk.columns]
-            tgt_chunks.append(chunk)
-        tgt_hashes = pd.concat(tgt_chunks, ignore_index=True) if tgt_chunks else pd.DataFrame()
+            tgt_chunks = []
+            for chunk in tgt_conn.execute_streaming(tgt_hash_q, chunk_size):
+                chunk.columns = [c.upper() for c in chunk.columns]
+                tgt_chunks.append(chunk)
+            tgt_hashes = pd.concat(tgt_chunks, ignore_index=True) if tgt_chunks else pd.DataFrame()
+        except Exception as e:
+            logger.warning("Hash strategy failed (%s) — falling back to full strategy", e)
+            return self._full_strategy(src_conn, tgt_conn, config)
 
         src_count = len(src_hashes)
         tgt_count = len(tgt_hashes)

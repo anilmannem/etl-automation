@@ -18,8 +18,11 @@ def get_connector(platform: str, config: ConnectionConfig) -> BaseConnector:
     elif platform in ("csv", "file"):
         from .csv_connector import CSVConnector
         return CSVConnector(config)
+    elif platform in ("sqlite", "sqlite3"):
+        from .sqlite_connector import SQLiteConnector
+        return SQLiteConnector(config)
     else:
         raise ValueError(
             f"Unsupported platform: {platform!r}. "
-            f"Supported: teradata, td, csv, file"
+            f"Supported: teradata, td, csv, file, sqlite"
         )

@@ -23,11 +23,19 @@ from etl_validator.engine.executor import SuiteResult, execute_suite
 from etl_validator.engine.result_store import ResultStore
 from etl_validator.engine.suite_loader import load_suite
 
+_log_fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+_log_file = Path(__file__).resolve().parent / "etl_validator.log"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format=_log_fmt,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_log_file, mode="a", encoding="utf-8"),
+    ],
 )
 log = logging.getLogger(__name__)
+log.info("Logging to file: %s", _log_file)
 
 app = FastAPI(title="ETL Validator API", version="1.0.0")
 
