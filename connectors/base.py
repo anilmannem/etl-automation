@@ -128,8 +128,14 @@ class BaseConnector(ABC):
 
     # ── query helpers ──
     @abstractmethod
+    def _execute_query_impl(self, query: str, params: dict | None = None) -> pd.DataFrame:
+        """Run *query* and return result as a DataFrame. Subclasses implement this."""
+
     def execute_query(self, query: str, params: dict | None = None) -> pd.DataFrame:
-        """Run *query* and return result as a DataFrame."""
+        """Run *query*, log it, and return result as a DataFrame."""
+        platform = getattr(self.config, 'platform', '?')
+        logger.info("[%s] SQL >> %s", platform, query[:500])
+        return self._execute_query_impl(query, params)
 
     def execute_streaming(
         self, query: str, chunk_size: int = 50_000
@@ -140,6 +146,8 @@ class BaseConnector(ABC):
         tables with millions of rows. Falls back to client-side chunking
         if the connector doesn't support server-side cursors.
         """
+        platform = getattr(self.config, 'platform', '?')
+        logger.info("[%s] SQL (streaming, chunk=%d) >> %s", platform, chunk_size, query[:500])
         try:
             for chunk in pd.read_sql_query(query, self._conn, chunksize=chunk_size):
                 chunk.columns = [c.upper() for c in chunk.columns]

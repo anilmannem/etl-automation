@@ -578,9 +578,18 @@ def _build_fingerprint_query(
             parts.append(
                 f'SUM(FARM_FINGERPRINT(TO_JSON_STRING(STRUCT({col_list})))) AS "DATA_FINGERPRINT"'
             )
+        elif platform == "postgresql":
+            # PostgreSQL: MD5 returns hex string, convert to numeric for SUM
+            concat_parts = " || '|' || ".join(
+                f'COALESCE(CAST("{safe_identifier(c)}" AS VARCHAR), \'__NULL__\')'
+                for c in columns[:30]
+            )
+            parts.append(
+                f'SUM((\'x\' || SUBSTR(MD5({concat_parts}), 1, 8))::bit(32)::bigint) AS "DATA_FINGERPRINT"'
+            )
         else:
-            # Generic SQL: hash via concatenation + numeric conversion
-            # Works on PostgreSQL, DuckDB, most ANSI-SQL engines
+            # Generic SQL: SUM of hash-like function via LENGTH + character codes
+            # Weak but universal fallback — forces detailed comparison on mismatch
             concat_parts = " || '|' || ".join(
                 f'COALESCE(CAST("{safe_identifier(c)}" AS VARCHAR), \'__NULL__\')'
                 for c in columns[:30]  # limit to 30 cols for concat safety
@@ -672,27 +681,28 @@ def pyramid_aggregate_check(src_conn, tgt_conn, src_table: str, tgt_table: str,
         src_fp = src_conn.execute_query(src_query)
         tgt_fp = tgt_conn.execute_query(tgt_query)
     except Exception as e:
-        logger.warning("Fingerprint query failed: %s — falling back to basic count", e)
-        # Fallback: just do row count
+        logger.warning("Fingerprint query failed: %s — skipping fingerprint (will do full comparison)", e)
+        # Fallback: return passed=False to force detailed comparison
+        # Never short-circuit as pass when fingerprint is unavailable
         try:
             src_t = safe_table_expr(src_table)
             tgt_t = safe_table_expr(tgt_table)
             src_c = int(src_conn.execute_query(f"SELECT COUNT(*) AS C FROM {src_t} {clause}").iloc[0, 0])
             tgt_c = int(tgt_conn.execute_query(f"SELECT COUNT(*) AS C FROM {tgt_t} {clause}").iloc[0, 0])
-            if src_c == tgt_c:
-                return {
-                    "passed": True,
-                    "src_count": src_c, "tgt_count": tgt_c,
-                    "reason": f"Row counts match ({src_c:,}), fingerprint unavailable",
-                    "layer": 1, "diagnostics": [], "details": [],
-                }
-            else:
+            if src_c != tgt_c:
                 return {
                     "passed": False,
                     "src_count": src_c, "tgt_count": tgt_c,
                     "reason": f"Row count mismatch: src={src_c:,}, tgt={tgt_c:,}",
                     "layer": 1, "diagnostics": ["row_count"], "details": [],
                 }
+            # Counts match but fingerprint unavailable — force detailed comparison
+            return {
+                "passed": False,
+                "src_count": src_c, "tgt_count": tgt_c,
+                "reason": f"Fingerprint unavailable — forcing detailed comparison (counts match: {src_c:,})",
+                "layer": 0, "diagnostics": ["fingerprint_unavailable"], "details": [],
+            }
         except Exception as e2:
             return {
                 "passed": False,

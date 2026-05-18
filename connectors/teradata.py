@@ -38,8 +38,7 @@ class TeradataConnector(BaseConnector):
         self._conn.timeout = query_timeout
         logger.info("Teradata connection established (connect_timeout=%ds, query_timeout=%ds).", timeout, query_timeout)
 
-    def execute_query(self, query: str, params: dict | None = None) -> pd.DataFrame:
-        logger.debug("Teradata query: %s", query)
+    def _execute_query_impl(self, query: str, params: dict | None = None) -> pd.DataFrame:
         return pd.read_sql_query(query, self._conn)
 
     def is_alive(self) -> bool:

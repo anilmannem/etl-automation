@@ -23,7 +23,7 @@ class CSVConnector(BaseConnector):
         self._df_cache: pd.DataFrame | None = None
         logger.info("CSV connector initialised for %s", self._file_path)
 
-    def execute_query(self, query: str, params: dict | None = None) -> pd.DataFrame:
+    def _execute_query_impl(self, query: str, params: dict | None = None) -> pd.DataFrame:
         raise NotImplementedError(
             "CSVConnector does not support raw SQL. Use helper methods."
         )
