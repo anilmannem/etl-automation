@@ -424,20 +424,20 @@ class DataCheck(BaseCheck):
         """
         logger.info("Using MINUS strategy (Teradata server-side diff)")
 
-        src_table = config.source_table
-        tgt_table = config.target_table
+        src_table = safe_table_expr(config.source_table)
+        tgt_table = safe_table_expr(config.target_table)
         where = config.where
         join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else None
         max_mismatches = config.extra.get("max_mismatches", 10_000)
 
         # Get columns (from target, excluding ignored)
-        src_cols = tgt_conn.get_column_names(tgt_table, exclude=config.ignore_columns)
+        src_cols = tgt_conn.get_column_names(config.target_table, exclude=config.ignore_columns)
         col_list = ", ".join(f'"{c}"' for c in src_cols)
         clause = f"WHERE {where}" if where else ""
 
         # Get row counts first (cheap single-AMP queries)
-        src_count = src_conn.get_row_count(src_table, where)
-        tgt_count = tgt_conn.get_row_count(tgt_table, where)
+        src_count = src_conn.get_row_count(config.source_table, where)
+        tgt_count = tgt_conn.get_row_count(config.target_table, where)
 
         # MINUS queries — executed entirely in Teradata
         minus_src_query = (
@@ -1026,10 +1026,10 @@ class DataCheck(BaseCheck):
                 full_where = f"{where} AND ({key_clause})" if where else key_clause
 
                 src_batch_df = src_conn.execute_query(
-                    f'SELECT {col_list} FROM {config.source_table} WHERE {full_where}'
+                    f'SELECT {col_list} FROM {safe_table_expr(config.source_table)} WHERE {full_where}'
                 )
                 tgt_batch_df = tgt_conn.execute_query(
-                    f'SELECT {col_list} FROM {config.target_table} WHERE {full_where}'
+                    f'SELECT {col_list} FROM {safe_table_expr(config.target_table)} WHERE {full_where}'
                 )
 
                 src_batch_df.columns = [c.upper() for c in src_batch_df.columns]
@@ -1144,15 +1144,15 @@ class DataCheck(BaseCheck):
         logger.info("Using FULL strategy for data comparison")
 
         where = config.where
-        src_table = config.source_table
-        tgt_table = config.target_table
+        src_table = safe_table_expr(config.source_table)
+        tgt_table = safe_table_expr(config.target_table)
         join_keys = config.join_keys if config.join_keys and config.join_keys != ["NA"] else None
         chunk_size = config.chunk_size
         max_mismatches = config.extra.get("max_mismatches", 10_000)
         use_streaming = config.extra.get("streaming", False)
 
         # Get columns
-        src_cols = tgt_conn.get_column_names(tgt_table, exclude=config.ignore_columns)
+        src_cols = tgt_conn.get_column_names(config.target_table, exclude=config.ignore_columns)
         col_list = ", ".join(f'"{c}"' for c in src_cols)
         clause = f"WHERE {where}" if where else ""
         order_by = f"ORDER BY {', '.join(f'\"' + k + '\"' for k in join_keys)}" if join_keys else ""

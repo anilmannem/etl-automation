@@ -52,11 +52,11 @@ class TeradataConnector(BaseConnector):
 
     def get_metadata(self, table: str) -> pd.DataFrame:
         # HELP COLUMN requires a real table/view name — cannot use subqueries.
-        # If table is a SELECT statement, extract columns from a LIMIT-0 query.
+        # If table is a SELECT statement, extract columns from a SAMPLE 1 query.
         table_expr = safe_table_expr(table)
         if table.strip().upper().startswith("SELECT "):
-            # Derive metadata from the subquery itself
-            df = pd.read_sql_query(f"SELECT TOP 1 * FROM {table_expr}", self._conn)
+            # Derive metadata from the subquery itself (Teradata uses SAMPLE, not TOP/LIMIT)
+            df = pd.read_sql_query(f"SELECT * FROM {table_expr} SAMPLE 1", self._conn)
             rows = []
             for col in df.columns:
                 rows.append({
