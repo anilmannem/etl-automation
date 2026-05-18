@@ -24,18 +24,40 @@ from etl_validator.engine.result_store import ResultStore
 from etl_validator.engine.suite_loader import load_suite
 
 _log_fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
-_log_file = Path(__file__).resolve().parent / "etl_validator.log"
+_log_dir = Path(__file__).resolve().parent / "logs"
+_log_dir.mkdir(exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format=_log_fmt,
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(_log_file, mode="a", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
-log.info("Logging to file: %s", _log_file)
+log.info("Log directory: %s", _log_dir)
+
+
+def _start_run_log(run_id: str) -> logging.FileHandler:
+    """Attach a per-run log file under logs/<timestamp>_<run_id>.log.
+
+    Returns the handler so it can be removed after the run completes.
+    """
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = _log_dir / f"{ts}_{run_id}.log"
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setFormatter(logging.Formatter(_log_fmt))
+    handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(handler)
+    log.info("Run log started: %s", log_path.name)
+    return handler
+
+
+def _stop_run_log(handler: logging.FileHandler):
+    """Remove the per-run file handler and close it."""
+    log.info("Run log ended")
+    logging.getLogger().removeHandler(handler)
+    handler.close()
 
 app = FastAPI(title="ETL Validator API", version="1.0.0")
 
@@ -330,6 +352,8 @@ def _csv_conn_dict(file_path: str) -> dict:
 @app.post("/api/run")
 def run_checks(req: AdhocRequest):
     """Run checks using saved connections or uploaded CSV files."""
+    run_id = req.batch_id or uuid.uuid4().hex[:12]
+    run_handler = _start_run_log(run_id)
     try:
         # Resolve connections — use uploaded file path or saved connection
         if req.source_file_path:
@@ -409,10 +433,12 @@ def run_checks(req: AdhocRequest):
                         source=src_label, target=tgt_label)
         rs.close()
 
+        _stop_run_log(run_handler)
         return _suite_result_to_dict(result)
 
     except Exception as e:
         log.exception("Check run failed")
+        _stop_run_log(run_handler)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -935,10 +961,13 @@ def run_from_metadata(req: RunFromMetadataRequest):
 
         # Run batch in background thread
         def _run_batch():
+            run_handler = _start_run_log(batch_id)
             try:
                 execute_batch(entries, connections_map, batch_config, batch_id=batch_id)
             except Exception as e:
                 log.exception("Background batch %s failed: %s", batch_id, e)
+            finally:
+                _stop_run_log(run_handler)
 
         thread = threading.Thread(target=_run_batch, daemon=True, name=f"batch-{batch_id}")
         thread.start()

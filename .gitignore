@@ -34,3 +34,5 @@ uploads/
 
 # Environment
 .env
+logs/
+etl_validator.log
