@@ -160,7 +160,7 @@ class BaseConnector(ABC):
                 yield df.iloc[i:i + chunk_size].copy()
 
     def get_row_count(self, table: str, where: str = "") -> int:
-        table = safe_identifier(table)
+        table = safe_table_expr(table)
         clause = f"WHERE {where}" if where else ""
         df = self.execute_query(f"SELECT COUNT(*) AS CNT FROM {table} {clause}")
         return int(df.iloc[0, 0])
@@ -183,7 +183,7 @@ class BaseConnector(ABC):
             f'SUM(CASE WHEN "{c}" IS NULL THEN 1 ELSE 0 END) AS "{c}"' for c in cols
         ]
         clause = f"WHERE {where}" if where else ""
-        query = f"SELECT {', '.join(expressions)} FROM {safe_identifier(table)} {clause}"
+        query = f"SELECT {', '.join(expressions)} FROM {safe_table_expr(table)} {clause}"
         return self.execute_query(query)
 
     def get_empty_counts(self, table: str, columns: list[str], where: str = "") -> pd.DataFrame:
@@ -193,7 +193,7 @@ class BaseConnector(ABC):
             for c in cols
         ]
         clause = f"WHERE {where}" if where else ""
-        query = f"SELECT {', '.join(expressions)} FROM {safe_identifier(table)} {clause}"
+        query = f"SELECT {', '.join(expressions)} FROM {safe_table_expr(table)} {clause}"
         return self.execute_query(query)
 
     def get_duplicates(self, table: str, columns: list[str], where: str = "") -> pd.DataFrame:
@@ -201,7 +201,7 @@ class BaseConnector(ABC):
         col_list = ", ".join(cols)
         clause = f"WHERE {where}" if where else ""
         query = (
-            f"SELECT {col_list} FROM {safe_identifier(table)} {clause} "
+            f"SELECT {col_list} FROM {safe_table_expr(table)} {clause} "
             f"GROUP BY {col_list} HAVING COUNT(*) > 1"
         )
         return self.execute_query(query)
@@ -218,13 +218,13 @@ class BaseConnector(ABC):
                     f'COALESCE(CAST({func}("{col}") AS DECIMAL(38,5)), 0) AS "{func}_{col}"'
                 )
         clause = f"WHERE {where}" if where else ""
-        query = f"SELECT {', '.join(expressions)} FROM {safe_identifier(table)} {clause}"
+        query = f"SELECT {', '.join(expressions)} FROM {safe_table_expr(table)} {clause}"
         return self.execute_query(query)
 
     def get_max_timestamp(self, table: str, column: str, where: str = ""):
         col = safe_identifier(column)
         clause = f"WHERE {where}" if where else ""
         df = self.execute_query(
-            f'SELECT MAX("{col}") AS MAX_TS FROM {safe_identifier(table)} {clause}'
+            f'SELECT MAX("{col}") AS MAX_TS FROM {safe_table_expr(table)} {clause}'
         )
         return df.iloc[0, 0]

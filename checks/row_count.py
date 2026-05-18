@@ -13,7 +13,7 @@ import logging
 import pandas as pd
 
 from .base import BaseCheck, CheckConfig, CheckResult, Status
-from ..connectors.base import safe_identifier, safe_identifiers, quote_identifier
+from ..connectors.base import safe_identifier, safe_identifiers, safe_table_expr, quote_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ class RowCountCheck(BaseCheck):
         """Get partition counts from a single connection (SQL or CSV)."""
         try:
             col = quote_identifier(safe_identifier(partition_col))
-            tbl = safe_identifier(table)
+            tbl = safe_table_expr(table)
             clause = f"WHERE {where}" if where else ""
             df = conn.execute_query(
                 f"SELECT {col} AS PARTITION_VAL, COUNT(*) AS CNT FROM {tbl} {clause} GROUP BY {col}"
@@ -148,8 +148,8 @@ class RowCountCheck(BaseCheck):
         try:
             keys = safe_identifiers(config.join_keys)
             key_cols = ", ".join(f'"{k}"' for k in keys)
-            src_table = safe_identifier(config.source_table)
-            tgt_table = safe_identifier(config.target_table)
+            src_table = safe_table_expr(config.source_table)
+            tgt_table = safe_table_expr(config.target_table)
             clause = f"WHERE {config.where}" if config.where else ""
 
             only_src_q = (

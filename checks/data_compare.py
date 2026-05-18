@@ -20,7 +20,7 @@ import logging
 import pandas as pd
 
 from .base import BaseCheck, CheckConfig, CheckResult, Status
-from ..connectors.base import safe_identifier, safe_identifiers, deterministic_sample_where
+from ..connectors.base import safe_identifier, safe_identifiers, safe_table_expr, deterministic_sample_where
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ def _build_row_hash_query(
             select_parts.insert(0, f'"{k}"')
 
     clause = f"WHERE {where}" if where else ""
-    return f"SELECT {', '.join(select_parts)} FROM {safe_identifier(table)} {clause}"
+    return f"SELECT {', '.join(select_parts)} FROM {safe_table_expr(table)} {clause}"
 
 
 def _column_level_diff(

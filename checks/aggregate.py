@@ -18,7 +18,7 @@ import re
 import pandas as pd
 
 from .base import BaseCheck, CheckConfig, CheckResult, Status
-from ..connectors.base import safe_identifier, safe_identifiers, quote_identifier
+from ..connectors.base import safe_identifier, safe_identifiers, safe_table_expr, quote_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def _get_cardinality(conn, table: str, columns: list[str], where: str = "") -> d
 
     # Try SQL first — use a sampled subquery for performance on large tables
     try:
-        tbl = safe_identifier(table)
+        tbl = safe_table_expr(table)
         clause = f"WHERE {where}" if where else ""
         count_exprs = ", ".join(
             f'COUNT(DISTINCT "{safe_identifier(c)}") AS "NDV_{c}"' for c in columns
@@ -399,7 +399,7 @@ class AggregateCheck(BaseCheck):
             gb_safe = [quote_identifier(safe_identifier(c)) for c in group_by_cols]
             gb_list = ", ".join(gb_safe)
             cols_safe = safe_identifiers(agg_columns)
-            tbl = safe_identifier(table)
+            tbl = safe_table_expr(table)
             clause = f"WHERE {where}" if where else ""
 
             expressions = list(gb_safe)

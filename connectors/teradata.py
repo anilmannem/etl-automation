@@ -51,8 +51,22 @@ class TeradataConnector(BaseConnector):
     # ── metadata ──────────────────────────────────────────────────────────────
 
     def get_metadata(self, table: str) -> pd.DataFrame:
-        table = safe_table_expr(table)
-        help_col_df = pd.read_sql_query(f"HELP COLUMN {table}.*", self._conn)
+        # HELP COLUMN requires a real table/view name — cannot use subqueries.
+        # If table is a SELECT statement, extract columns from a LIMIT-0 query.
+        table_expr = safe_table_expr(table)
+        if table.strip().upper().startswith("SELECT "):
+            # Derive metadata from the subquery itself
+            df = pd.read_sql_query(f"SELECT TOP 1 * FROM {table_expr}", self._conn)
+            rows = []
+            for col in df.columns:
+                rows.append({
+                    "COLUMN_NAME": col.upper(),
+                    "DATA_TYPE": str(df[col].dtype).upper(),
+                    "NULLABLE": "Y",
+                })
+            return pd.DataFrame(rows)
+
+        help_col_df = pd.read_sql_query(f"HELP COLUMN {table_expr}.*", self._conn)
         help_col_df["Decimal Total Digits"] = (
             help_col_df["Decimal Total Digits"].fillna(0).astype(int)
         )

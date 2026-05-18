@@ -14,7 +14,7 @@ import logging
 import pandas as pd
 
 from .base import BaseCheck, CheckConfig, CheckResult, Status
-from ..connectors.base import safe_identifier, quote_identifier
+from ..connectors.base import safe_identifier, safe_table_expr, quote_identifier
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ class DuplicateCheck(BaseCheck):
         try:
             cols = [quote_identifier(safe_identifier(c)) for c in columns]
             col_list = ", ".join(cols)
-            tbl = safe_identifier(table)
+            tbl = safe_table_expr(table)
             clause = f"WHERE {where}" if where else ""
             query = (
                 f"SELECT {col_list}, COUNT(*) AS _DUP_COUNT "
