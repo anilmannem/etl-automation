@@ -29,9 +29,17 @@ class CSVConnector(BaseConnector):
         )
 
     def read_dataframe(self) -> pd.DataFrame:
-        """Read CSV with caching — file is only parsed once."""
+        """Read CSV with caching — file is only parsed once.
+
+        Tries UTF-8 first, falls back to latin-1 (which accepts any byte).
+        """
         if self._df_cache is None:
-            self._df_cache = pd.read_csv(self._file_path, header=0)
+            try:
+                self._df_cache = pd.read_csv(self._file_path, header=0, encoding="utf-8")
+            except UnicodeDecodeError:
+                logger.warning("UTF-8 decode failed for %s — retrying with latin-1 encoding",
+                               self._file_path)
+                self._df_cache = pd.read_csv(self._file_path, header=0, encoding="latin-1")
             logger.info("CSV loaded: %d rows, %d columns", len(self._df_cache), len(self._df_cache.columns))
         return self._df_cache.copy()
 
